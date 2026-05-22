@@ -1,0 +1,83 @@
+name: ws-ap3825i
+description: Extreme Networks WS-AP3825i flasher (stock → OpenWrt 25.12.4 via 23.05.5 stepping stone)
+
+vars:
+  ssh_password: ""
+  ap_ip: 192.168.1.20
+  server_ip: 192.168.1.10
+  ap_lan_ip: 192.168.1.1
+  tftp_dir: /home/jp/Projects/openwrt/tftp
+  initramfs_23: openwrt-23.05.5-mpc85xx-p1020-extreme-networks_ws-ap3825i-initramfs-kernel.bin
+  sysupgrade_25: openwrt-25.12.4-mpc85xx-p1020-extreme-networks_ws-ap3825i-squashfs-sysupgrade.bin
+
+triggers:
+  - id: AUTOBOOT
+    pattern: "Hit 'd' for diagnostics"
+    action: { send: "\r" }
+  - id: LOGIN
+    pattern: "\nlogin: "
+    action: { type: "admin", wait: 1.0, delay: 0.10 }
+  - id: PASSWORD
+    pattern: "\npassword: "
+    action: { type: "new2day", wait: 0.7, delay: 0.10 }
+  - id: ACTIVATE
+    pattern: "Please press Enter to activate this console"
+    action: { send: "\r", wait: 0.3 }
+
+steps:
+  - id: require_factory_reset
+    require_user: |
+      If this is a fresh AP with non-default boot password (shadow file > 0 bytes),
+      `touch ${state_dir}/disable_autoboot`, let it boot to stock OS (none) login:,
+      hold the reset pinhole for 5 seconds, then `rm ${state_dir}/disable_autoboot`
+      and power-cycle. We'll catch U-Boot on the next boot.
+    until: "Boot \\(PRI\\)->"
+    timeout: 600
+
+  - id: setup_uboot_env
+    send_lines: |
+      setenv ipaddr ${ap_ip}
+      setenv serverip ${server_ip}
+      setenv ramboot_openwrt "tftpboot 0x2000000 ${initramfs_23}; interrupts off; bootm 0x2000000;"
+      setenv boot_openwrt "bootm 0xEC000000;"
+      setenv bootcmd "run boot_openwrt"
+      saveenv
+      run ramboot_openwrt
+    between_lines: 1.8
+
+  - id: wait_initramfs
+    wait_ssh: { host: "${ap_lan_ip}", timeout: 240 }
+
+  - id: scp_25_12_4
+    scp:
+      host: "${ap_lan_ip}"
+      local: "${tftp_dir}/${sysupgrade_25}"
+      remote: "/tmp/fw.bin"
+
+  - id: disable_autoboot_for_clean_boot
+    disable_trigger: AUTOBOOT
+
+  - id: mtd_write_25_12_4
+    ssh:
+      host: "${ap_lan_ip}"
+      cmd: "mtd -r write /tmp/fw.bin firmware"
+      timeout: 300
+
+  - id: wait_first_boot
+    wait: 30
+  - id: wait_ssh_after_flash
+    wait_ssh: { host: "${ap_lan_ip}", timeout: 300 }
+
+  - id: wait_jffs2_build
+    poll_load_until: 0
+    timeout: 600
+
+  - id: reboot_for_jffs2
+    ssh: { cmd: "sync; reboot", host: "${ap_lan_ip}", timeout: 10 }
+  - id: wait_second_boot
+    wait: 25
+  - id: wait_jffs2_ssh
+    wait_ssh: { host: "${ap_lan_ip}", timeout: 300 }
+
+  - id: verify_done
+    assert_ssh: "cat /etc/openwrt_release | grep -q 25.12.4 && mount | grep -q jffs2"
