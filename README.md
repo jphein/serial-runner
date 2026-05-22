@@ -75,8 +75,13 @@ See `plugins/ws-ap3825i.yaml` for the reference.
 
 ## Status
 
-v0.1 — works for the WS-AP3825i recipe. No LLM integration yet (v0.3). No
-plugin registry (v0.2). Single serial port (v0.4 = multi-port).
+v0.2 — works for the WS-AP3825i recipe. LLM channel (narrate + trigger modes)
+with prompt caching. No plugin registry yet (v0.3). Single serial port (v0.4 =
+multi-port).
+
+## License
+
+GPL-3.0-or-later. See [LICENSE](LICENSE).
 
 ## Design notes
 

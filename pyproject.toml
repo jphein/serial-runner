@@ -6,6 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "serial-runner"
 version = "0.1.0"
 description = "AI-assisted serial terminal with runbook plugins"
+license = { text = "GPL-3.0-or-later" }
 requires-python = ">=3.10"
 dependencies = [
   "pyserial>=3.5",
