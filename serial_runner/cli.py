@@ -5,8 +5,14 @@ from .daemon import Daemon
 
 
 def cmd_daemon(args):
-    """Run the daemon (no runbook) — useful for raw serial access."""
+    """Run the daemon. If --plugin is given, install its triggers but skip steps."""
     d = Daemon(port=args.port, baud=args.baud, state_dir=args.state_dir)
+    if getattr(args, "plugin", None):
+        plugin_path = _resolve_plugin(args.plugin)
+        book = rb.load(plugin_path)
+        ctx = rb.RunbookContext(daemon=d, vars=dict(book.get("vars", {})))
+        rb.install_triggers(book, d, ctx)
+        print(f"[cli] loaded plugin: {book.get('name')} from {plugin_path}", flush=True)
     d.start()
 
 
@@ -89,9 +95,13 @@ def cmd_up(args):
         subprocess.run(["tmux", "kill-session", "-t", session], capture_output=True)
 
     # Daemon command. Run as `sudo` only if requested.
+    # If --plugin is set, the daemon installs its triggers itself — no
+    # separate `run` pane needed (which would try to open the same serial port).
+    py = sys.executable  # works under pipx, venv, or system python
+    plugin_arg = f" --plugin {args.plugin}" if args.plugin else ""
     daemon_cmd = (
         ("sudo " if args.sudo else "")
-        + f"python3 -m serial_runner.cli daemon --port {args.port} --baud {args.baud} --state-dir {state_dir}"
+        + f"{py} -m serial_runner.cli daemon --port {args.port} --baud {args.baud} --state-dir {state_dir}{plugin_arg}"
     )
 
     # tmux layout:
@@ -107,13 +117,15 @@ def cmd_up(args):
         "tmux", "split-window", "-h", "-t", f"{session}:0", "-l", "60", daemon_cmd,
     ], check=True)
     if args.plugin:
-        run_cmd = f"sleep 2; python3 -m serial_runner.cli run --plugin {args.plugin} --port {args.port} --baud {args.baud} --state-dir {state_dir}"
+        # Triggers already installed in the daemon above; this pane just shows
+        # plugin info / any future runbook steps if invoked manually.
+        info_cmd = f"echo 'plugin {args.plugin} loaded in daemon (pane 1)'; echo 'run steps manually with: serial-runner run --plugin {args.plugin}'; exec bash"
         subprocess.run([
-            "tmux", "split-window", "-v", "-t", f"{session}:0.1", run_cmd,
+            "tmux", "split-window", "-v", "-t", f"{session}:0.1", info_cmd,
         ], check=True)
     subprocess.run([
         "tmux", "split-window", "-v", "-t", f"{session}:0.0", "-l", "8",
-        f"while true; do python3 -m serial_runner.cli keys --fifo {fifo_path}; echo '[keys.py exited — restarting]'; sleep 1; done",
+        f"while true; do {py} -m serial_runner.cli keys --fifo {fifo_path}; echo '[keys.py exited — restarting]'; sleep 1; done",
     ], check=True)
     subprocess.run(["tmux", "set-option", "-t", session, "history-limit", "1000000"], check=True)
     subprocess.run(["tmux", "set-option", "-t", session, "mouse", "on"], check=True)
@@ -152,6 +164,7 @@ def main():
     common.add_argument("--state-dir", default=os.path.expanduser("~/.serial-runner"))
 
     p_daemon = sub.add_parser("daemon", parents=[common], help="run daemon only")
+    p_daemon.add_argument("--plugin", help="install plugin's triggers (skip steps)")
     p_daemon.set_defaults(func=cmd_daemon)
 
     p_keys = sub.add_parser("keys", help="run keystroke relay (attach to running daemon)")
