@@ -51,8 +51,8 @@ def _clean(buf: bytes, drop_kernel_ts: bool, clean_bytes: bool = False) -> tuple
     return "\n".join(out_lines), dropped
 
 
-def _split_content(content: str, max_bytes: int) -> list[str]:
-    """Split content into chunks each at most max_bytes UTF-8 bytes.
+def _split_content(data: bytes, max_bytes: int) -> list[str]:
+    """Split already-encoded UTF-8 bytes into chunks of at most max_bytes.
 
     Prefers to split on the nearest newline boundary at or before max_bytes;
     falls back to a hard byte-split if no newline is available in the window.
@@ -62,7 +62,6 @@ def _split_content(content: str, max_bytes: int) -> list[str]:
     no newline (e.g., binary-ish blobs), where 'utf-8','replace' decoding will
     repair any boundary-straddling byte sequences.
     """
-    data = content.encode("utf-8")
     chunks: list[str] = []
     i = 0
     n = len(data)
@@ -92,6 +91,8 @@ def watch(
     tick is split across multiple JSON lines (each tagged with chunk_index /
     chunk_total) so downstream consumers aren't flooded by huge bursts.
     """
+    if max_bytes_per_tick is not None and max_bytes_per_tick <= 0:
+        raise ValueError("max_bytes_per_tick must be greater than 0")
     prev_size = os.path.getsize(log_path) if (os.path.exists(log_path) and from_end) else 0
     while True:
         try:
@@ -106,8 +107,8 @@ def watch(
             content, dropped = _clean(buf, drop_kernel_ts, clean_bytes)
             t_str = time.strftime("%H:%M:%S")
             epoch = time.time()
-            if max_bytes_per_tick is not None and len(content.encode("utf-8")) > max_bytes_per_tick:
-                pieces = _split_content(content, max_bytes_per_tick)
+            if max_bytes_per_tick is not None and len(content_bytes := content.encode("utf-8")) > max_bytes_per_tick:
+                pieces = _split_content(content_bytes, max_bytes_per_tick)
                 total = len(pieces)
                 for idx, piece in enumerate(pieces):
                     obj = {
