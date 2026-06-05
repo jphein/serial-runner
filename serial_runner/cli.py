@@ -1,5 +1,5 @@
 """serial-runner CLI."""
-import argparse, os, sys, subprocess, threading, time
+import argparse, os, shlex, sys, subprocess, threading, time
 from . import runbook as rb
 from .daemon import Daemon
 
@@ -10,6 +10,8 @@ def cmd_daemon(args):
     if getattr(args, "plugin", None):
         plugin_path = _resolve_plugin(args.plugin)
         book = rb.load(plugin_path)
+        if not isinstance(book, dict):
+            raise ValueError(f"plugin {plugin_path!r} did not parse to a dict (got {type(book).__name__})")
         ctx = rb.RunbookContext(daemon=d, vars=dict(book.get("vars", {})))
         rb.install_triggers(book, d, ctx)
         print(f"[cli] loaded plugin: {book.get('name')} from {plugin_path}", flush=True)
@@ -98,10 +100,10 @@ def cmd_up(args):
     # If --plugin is set, the daemon installs its triggers itself — no
     # separate `run` pane needed (which would try to open the same serial port).
     py = sys.executable  # works under pipx, venv, or system python
-    plugin_arg = f" --plugin {args.plugin}" if args.plugin else ""
+    plugin_arg = f" --plugin {shlex.quote(args.plugin)}" if args.plugin else ""
     daemon_cmd = (
         ("sudo " if args.sudo else "")
-        + f"{py} -m serial_runner.cli daemon --port {args.port} --baud {args.baud} --state-dir {state_dir}{plugin_arg}"
+        + f"{shlex.quote(py)} -m serial_runner.cli daemon --port {shlex.quote(args.port)} --baud {args.baud} --state-dir {shlex.quote(state_dir)}{plugin_arg}"
     )
 
     # tmux layout:
@@ -119,13 +121,13 @@ def cmd_up(args):
     if args.plugin:
         # Triggers already installed in the daemon above; this pane just shows
         # plugin info / any future runbook steps if invoked manually.
-        info_cmd = f"echo 'plugin {args.plugin} loaded in daemon (pane 1)'; echo 'run steps manually with: serial-runner run --plugin {args.plugin}'; exec bash"
+        info_cmd = f'echo "plugin {shlex.quote(args.plugin)} loaded in daemon (pane 1)"; echo "run steps manually with: serial-runner run --plugin {shlex.quote(args.plugin)}"; exec bash'
         subprocess.run([
             "tmux", "split-window", "-v", "-t", f"{session}:0.1", info_cmd,
         ], check=True)
     subprocess.run([
         "tmux", "split-window", "-v", "-t", f"{session}:0.0", "-l", "8",
-        f"while true; do {py} -m serial_runner.cli keys --fifo {fifo_path}; echo '[keys.py exited — restarting]'; sleep 1; done",
+        f"while true; do {shlex.quote(py)} -m serial_runner.cli keys --fifo {shlex.quote(fifo_path)}; echo '[keys.py exited — restarting]'; sleep 1; done",
     ], check=True)
     subprocess.run(["tmux", "set-option", "-t", session, "history-limit", "1000000"], check=True)
     subprocess.run(["tmux", "set-option", "-t", session, "mouse", "on"], check=True)
