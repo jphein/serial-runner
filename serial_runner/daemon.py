@@ -1,6 +1,6 @@
 """serial-runner daemon: owns one serial port, logs to disk, accepts input via FIFO,
 runs trigger engine with byte-level pattern detection."""
-import serial, os, sys, time, threading, re
+import serial, os, sys, time, threading, re, stat
 from dataclasses import dataclass, field
 from typing import Callable, Optional, Pattern, Union
 
@@ -125,11 +125,18 @@ class Daemon:
             bytesize=8, parity="N", stopbits=1, timeout=0.05,
         )
         self.logf = open(self.log_path, "ab", buffering=0)
-        # Create FIFO
-        if os.path.exists(self.fifo_path):
-            os.unlink(self.fifo_path)
-        os.mkfifo(self.fifo_path)
-        os.chmod(self.fifo_path, 0o666)
+        # Create FIFO if missing. CRUCIAL: don't unlink an existing FIFO —
+        # keys.py readers may already have it open by inode; unlinking creates
+        # an inode race where they write into an orphaned pipe nobody reads.
+        # Only recreate if the path exists but isn't a FIFO.
+        try:
+            st = os.lstat(self.fifo_path)
+            if not stat.S_ISFIFO(st.st_mode):
+                os.unlink(self.fifo_path)
+                raise FileNotFoundError
+        except FileNotFoundError:
+            os.mkfifo(self.fifo_path)
+            os.chmod(self.fifo_path, 0o666)
 
         print(f"[daemon] {self.port}@{self.baud}", flush=True)
         print(f"[daemon] log {self.log_path}", flush=True)
