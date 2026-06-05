@@ -35,10 +35,17 @@ class Daemon:
         fifo_path: str = None,
         state_dir: str = None,
         auto_fallback_port: bool = False,
+        out_port: Optional[str] = None,
     ):
         self.port = port
         self.baud = baud
         self.auto_fallback_port = auto_fallback_port
+        # Optional separate TX port. When set, bytes from the FIFO and trigger
+        # `send()` calls go to this port instead of the main `port`. Use case:
+        # asymmetric wiring where a clean RX path and a clean TX path live on
+        # different physical ports (e.g., TTL header for RX, RS-232 for TX).
+        self.out_port = out_port
+        self.ser_out = None
         self.state_dir = state_dir or os.path.expanduser("~/.serial-runner")
         os.makedirs(self.state_dir, exist_ok=True)
         self.log_path = log_path or os.path.join(self.state_dir, "serial.log")
@@ -75,7 +82,8 @@ class Daemon:
     def send(self, data: Union[bytes, str]) -> None:
         if isinstance(data, str):
             data = data.encode()
-        self.ser.write(data); self.ser.flush()
+        tx = self.ser_out if self.ser_out is not None else self.ser
+        tx.write(data); tx.flush()
 
     def type_chars(self, s: str, delay: float = 0.10, end: str = "\r") -> None:
         """Char-by-char with delay — for prompts that drop chars at fast input."""
@@ -180,7 +188,8 @@ class Daemon:
                     data = os.read(fd, 4096)
                     if not data:
                         os.close(fd); break
-                    self.ser.write(data); self.ser.flush()
+                    tx = self.ser_out if self.ser_out is not None else self.ser
+                    tx.write(data); tx.flush()
             except Exception as e:
                 print(f"[daemon] fifo err: {e}", flush=True)
                 time.sleep(0.5)
@@ -221,6 +230,20 @@ class Daemon:
             print(f"port {self.port} not present — waiting...", flush=True)
             self._running = True
             self._reopen_serial()
+        # Open the optional separate TX port, if configured. Asymmetric wiring:
+        # the main port handles reads (board → us) and `out_port` handles writes
+        # (us → board). Useful when only one direction is clean on a given path.
+        if self.out_port:
+            try:
+                self.ser_out = serial.Serial(
+                    self.out_port, self.baud,
+                    bytesize=8, parity="N", stopbits=1, timeout=0.05,
+                    rtscts=False, xonxoff=False,
+                )
+                print(f"[daemon] tx port: {self.out_port}@{self.baud}", flush=True)
+            except (serial.SerialException, OSError) as e:
+                print(f"[daemon] WARN: opening out-port {self.out_port} failed: {e} — falling back to main port for TX", flush=True)
+                self.ser_out = None
         # Create FIFO if missing. CRUCIAL: don't unlink an existing FIFO —
         # keys.py readers may already have it open by inode; unlinking creates
         # an inode race where they write into an orphaned pipe nobody reads.

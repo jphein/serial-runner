@@ -12,6 +12,7 @@ def cmd_daemon(args):
         baud=args.baud,
         state_dir=args.state_dir,
         auto_fallback_port=getattr(args, "auto_fallback_port", False),
+        out_port=getattr(args, "out_port", None),
     )
     plugin_path = getattr(args, "plugin", None)
     if plugin_path:
@@ -180,6 +181,7 @@ def cmd_run(args):
         baud=args.baud,
         state_dir=args.state_dir,
         auto_fallback_port=args.auto_fallback_port,
+        out_port=getattr(args, "out_port", None),
     )
     ctx = rb.RunbookContext(daemon=d, vars=dict(book.get("vars", {})))
     # Allow CLI overrides: --var key=val
@@ -290,6 +292,11 @@ def main():
         "--auto-fallback-port",
         action="store_true",
         help="if --port is missing, fall back to any /dev/ttyUSB*/ttyACM* (risky: may pick wrong device)",
+    )
+    common.add_argument(
+        "--out-port",
+        default=None,
+        help="optional separate TX port. When set, FIFO writes and trigger send()s go here while --port is used only for reads. For asymmetric wiring (e.g. clean TTL header for RX, RS-232 for TX).",
     )
 
     p_daemon = sub.add_parser("daemon", parents=[common], help="run daemon only")
