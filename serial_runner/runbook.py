@@ -208,7 +208,10 @@ def install_triggers(rb: dict, daemon: Daemon, ctx: RunbookContext) -> None:
         action = _make_action(t["action"], daemon, ctx)
         raw = t["pattern"]
         if isinstance(raw, str) and raw.startswith("re:"):
-            pattern = re.compile(raw[3:].encode())
+            try:
+                pattern = re.compile(raw[3:].encode())
+            except re.error as e:
+                raise ValueError(f"trigger {t['id']!r} has invalid regex pattern {raw!r}: {e}") from e
         elif isinstance(raw, str):
             pattern = raw.encode()
         else:
