@@ -2,6 +2,7 @@
 runs trigger engine with byte-level pattern detection."""
 import serial, os, sys, time, threading, re, stat, glob, signal
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Callable, Optional, Pattern, Union
 
 
@@ -102,8 +103,11 @@ class Daemon:
                 if len(self.det_buf) > self.DET_BUF_MAX:
                     del self.det_buf[: -self.DET_BUF_MAX]
                 snap = bytes(self.det_buf)
+                # Snapshot triggers under the lock so a concurrent reload
+                # (which atomically reassigns self.triggers) can't race us.
+                triggers = list(self.triggers)
             now = time.time()
-            for t in self.triggers:
+            for t in triggers:
                 if self.is_disabled(t.name):
                     continue
                 if now - t.last_fired < t.debounce_s:
@@ -196,10 +200,16 @@ class Daemon:
                 print(f"[daemon] reload error: plugin YAML is not a mapping: {type(book).__name__}", flush=True)
                 return
             ctx = rb.RunbookContext(daemon=self, vars=dict(book.get("vars", {})))
+            # Build the new trigger list into a throwaway holder first.  If
+            # install_triggers raises (bad action, invalid pattern, etc.) the
+            # live self.triggers stays untouched and the daemon keeps running
+            # on the previous config.
+            holder = SimpleNamespace(triggers=[])
+            holder.add_trigger = holder.triggers.append
+            rb.install_triggers(book, holder, ctx)
             with self.lock:
-                self.triggers = []
-                rb.install_triggers(book, self, ctx)
-            print(f"[daemon] plugin reloaded: {len(self.triggers)} triggers", flush=True)
+                self.triggers = holder.triggers
+            print(f"[daemon] plugin reloaded: {len(holder.triggers)} triggers", flush=True)
         except Exception as e:
             print(f"[daemon] reload error ({type(e).__name__}): {e} — keeping existing triggers", flush=True)
 
@@ -231,7 +241,12 @@ class Daemon:
 
         # SIGHUP → reload the plugin YAML and swap triggers. Threaded so the
         # signal handler returns immediately (no I/O in the handler itself).
-        signal.signal(signal.SIGHUP, lambda *_: threading.Thread(target=self._reload_plugin, daemon=True).start())
+        # SIGHUP does not exist on Windows; guard the registration so the
+        # daemon still starts there (just without hot-reload).
+        if hasattr(signal, "SIGHUP"):
+            signal.signal(signal.SIGHUP, lambda *_: threading.Thread(target=self._reload_plugin, daemon=True).start())
+        else:
+            print("[daemon] SIGHUP not available on this platform; plugin hot-reload disabled", flush=True)
 
         self._running = True
         threading.Thread(target=self._reader, daemon=True).start()
