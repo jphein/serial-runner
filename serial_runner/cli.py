@@ -5,20 +5,24 @@ from .daemon import Daemon
 
 
 def cmd_daemon(args):
-    """Run the daemon. If --plugin is given, install its triggers but skip steps."""
+    """Run the daemon. If --plugin is given, install its triggers (skip steps).
+    The plugin path is remembered so SIGHUP can hot-reload the YAML without restarting."""
     d = Daemon(
         port=args.port,
         baud=args.baud,
         state_dir=args.state_dir,
         auto_fallback_port=getattr(args, "auto_fallback_port", False),
     )
-    if getattr(args, "plugin", None):
-        plugin_path = _resolve_plugin(args.plugin)
+    plugin_path = getattr(args, "plugin", None)
+    if plugin_path:
+        plugin_path = _resolve_plugin(plugin_path)
         book = rb.load(plugin_path)
         if not isinstance(book, dict):
             raise ValueError(f"plugin {plugin_path!r} did not parse to a dict (got {type(book).__name__})")
         ctx = rb.RunbookContext(daemon=d, vars=dict(book.get("vars", {})))
         rb.install_triggers(book, d, ctx)
+        # Remember the path so SIGHUP can re-read the YAML.
+        d.plugin_path = plugin_path
         print(f"[cli] loaded plugin: {book.get('name')} from {plugin_path}", flush=True)
     d.start()
 
@@ -186,7 +190,7 @@ def main():
     )
 
     p_daemon = sub.add_parser("daemon", parents=[common], help="run daemon only")
-    p_daemon.add_argument("--plugin", help="install plugin's triggers (skip steps)")
+    p_daemon.add_argument("--plugin", help="runbook YAML to install triggers from (hot-reloadable via SIGHUP)")
     p_daemon.set_defaults(func=cmd_daemon)
 
     p_keys = sub.add_parser("keys", help="run keystroke relay (attach to running daemon)")
