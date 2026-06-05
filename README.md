@@ -73,6 +73,10 @@ YAML at `plugins/<name>.yaml`. Two sections:
 
 See `plugins/ws-ap3825i.yaml` for the reference.
 
+Reload plugin without restarting the daemon: `kill -HUP $(pgrep -f 'serial_runner.cli daemon')`.
+The daemon re-reads its `--plugin` YAML and atomically swaps the trigger list; a
+bad YAML keeps the previous triggers running.
+
 ## Status
 
 v0.2 — works for the WS-AP3825i recipe. LLM channel (narrate + trigger modes)

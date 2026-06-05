@@ -1,6 +1,6 @@
 """serial-runner daemon: owns one serial port, logs to disk, accepts input via FIFO,
 runs trigger engine with byte-level pattern detection."""
-import serial, os, sys, time, threading, re, stat, glob
+import serial, os, sys, time, threading, re, stat, glob, signal
 from dataclasses import dataclass, field
 from typing import Callable, Optional, Pattern, Union
 
@@ -49,6 +49,9 @@ class Daemon:
         self.triggers: list[Trigger] = []
         self._running = False
         self.connected_event = threading.Event()
+        # Path to plugin YAML, set by the CLI when --plugin is given.
+        # Enables SIGHUP-driven hot-reload of triggers without restarting the daemon.
+        self.plugin_path: Optional[str] = None
 
     def wait_connected(self, timeout: Optional[float] = None) -> bool:
         """Block until the serial port is open (or timeout). Returns True if connected."""
@@ -178,6 +181,28 @@ class Daemon:
                 print(f"[daemon] fifo err: {e}", flush=True)
                 time.sleep(0.5)
 
+    def _reload_plugin(self) -> None:
+        """Re-read the YAML at self.plugin_path and atomically swap triggers.
+
+        Bad YAML/missing file: log and keep the old triggers running.
+        Triggered via SIGHUP — see start()."""
+        if self.plugin_path is None:
+            print("[daemon] reload requested but no plugin path set; ignoring", flush=True)
+            return
+        try:
+            from . import runbook as rb
+            book = rb.load(self.plugin_path)
+            if not isinstance(book, dict):
+                print(f"[daemon] reload error: plugin YAML is not a mapping: {type(book).__name__}", flush=True)
+                return
+            ctx = rb.RunbookContext(daemon=self, vars=dict(book.get("vars", {})))
+            with self.lock:
+                self.triggers = []
+                rb.install_triggers(book, self, ctx)
+            print(f"[daemon] plugin reloaded: {len(self.triggers)} triggers", flush=True)
+        except Exception as e:
+            print(f"[daemon] reload error ({type(e).__name__}): {e} — keeping existing triggers", flush=True)
+
     def start(self) -> None:
         # Open log first so reconnection messages have a destination
         self.logf = open(self.log_path, "ab", buffering=0)
@@ -203,6 +228,10 @@ class Daemon:
         print(f"[daemon] log {self.log_path}", flush=True)
         print(f"[daemon] fifo {self.fifo_path}", flush=True)
         print(f"[daemon] triggers: {', '.join(t.name for t in self.triggers)}", flush=True)
+
+        # SIGHUP → reload the plugin YAML and swap triggers. Threaded so the
+        # signal handler returns immediately (no I/O in the handler itself).
+        signal.signal(signal.SIGHUP, lambda *_: threading.Thread(target=self._reload_plugin, daemon=True).start())
 
         self._running = True
         threading.Thread(target=self._reader, daemon=True).start()
