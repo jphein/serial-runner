@@ -33,9 +33,11 @@ class Daemon:
         log_path: str = None,
         fifo_path: str = None,
         state_dir: str = None,
+        auto_fallback_port: bool = False,
     ):
         self.port = port
         self.baud = baud
+        self.auto_fallback_port = auto_fallback_port
         self.state_dir = state_dir or os.path.expanduser("~/.serial-runner")
         os.makedirs(self.state_dir, exist_ok=True)
         self.log_path = log_path or os.path.join(self.state_dir, "serial.log")
@@ -46,6 +48,11 @@ class Daemon:
         self.lock = threading.Lock()
         self.triggers: list[Trigger] = []
         self._running = False
+        self.connected_event = threading.Event()
+
+    def wait_connected(self, timeout: Optional[float] = None) -> bool:
+        """Block until the serial port is open (or timeout). Returns True if connected."""
+        return self.connected_event.wait(timeout)
 
     def add_trigger(self, t: Trigger) -> None:
         self.triggers.append(t)
@@ -79,14 +86,15 @@ class Daemon:
                 data = self.ser.read(4096)
             except (serial.SerialException, OSError) as e:
                 print(f"[daemon] serial read err: {e} — reopening", flush=True)
-                self.logf.write(f"\n[daemon] PORT LOST: {e}\n".encode())
+                with self.lock:
+                    self.logf.write(f"\n[daemon] PORT LOST: {e}\n".encode())
                 self._reopen_serial()
                 continue
             if not data:
                 continue
             sys.stdout.buffer.write(data); sys.stdout.buffer.flush()
-            self.logf.write(data)
             with self.lock:
+                self.logf.write(data)
                 self.det_buf.extend(data)
                 if len(self.det_buf) > self.DET_BUF_MAX:
                     del self.det_buf[: -self.DET_BUF_MAX]
@@ -104,9 +112,12 @@ class Daemon:
                     threading.Thread(target=self._fire, args=(t,), daemon=True).start()
 
     def _find_port(self):
-        """Return the configured port if it exists, else any /dev/ttyUSB*/ttyACM*."""
+        """Return the configured port if it exists.
+        If auto_fallback_port is set, fall back to any /dev/ttyUSB*/ttyACM*."""
         if os.path.exists(self.port):
             return self.port
+        if not self.auto_fallback_port:
+            return None
         candidates = sorted(glob.glob("/dev/ttyUSB*") + glob.glob("/dev/ttyACM*"))
         return candidates[0] if candidates else None
 
@@ -118,8 +129,10 @@ class Daemon:
         try:
             self.ser = serial.Serial(port, self.baud, bytesize=8, parity="N", stopbits=1, timeout=0.05)
             if port != self.port:
-                print(f"[daemon] port {self.port} unavailable, using {port} instead", flush=True)
-                self.logf.write(f"\n[daemon] PORT REMAPPED: {self.port} -> {port}\n".encode())
+                print(f"[daemon] WARN: port {self.port} unavailable, falling back to {port} (auto-fallback enabled)", flush=True)
+                with self.lock:
+                    self.logf.write(f"\n[daemon] PORT REMAPPED: {self.port} -> {port}\n".encode())
+            self.connected_event.set()
             return True
         except (serial.SerialException, OSError) as e:
             print(f"[daemon] open {port} failed: {e}", flush=True)
@@ -127,22 +140,26 @@ class Daemon:
 
     def _reopen_serial(self):
         """Block-with-backoff until the port comes back."""
-        try:
-            self.ser.close()
-        except Exception:
-            pass
+        self.connected_event.clear()
+        if self.ser is not None:
+            try:
+                self.ser.close()
+            except Exception:
+                pass
         backoff = 0.5
         while self._running:
             if self._open_serial():
                 print(f"[daemon] reconnected to {self.ser.port}", flush=True)
-                self.logf.write(f"\n[daemon] PORT RECONNECTED: {self.ser.port}\n".encode())
+                with self.lock:
+                    self.logf.write(f"\n[daemon] PORT RECONNECTED: {self.ser.port}\n".encode())
                 return
             time.sleep(backoff)
             backoff = min(backoff * 1.5, 5.0)
 
     def _fire(self, t: Trigger) -> None:
         print(f"[daemon] TRIGGER {t.name} fired", flush=True)
-        self.logf.write(f"\n[daemon] AUTO {t.name} @ {time.strftime('%H:%M:%S')}\n".encode())
+        with self.lock:
+            self.logf.write(f"\n[daemon] AUTO {t.name} @ {time.strftime('%H:%M:%S')}\n".encode())
         try:
             t.action()
         except Exception as e:

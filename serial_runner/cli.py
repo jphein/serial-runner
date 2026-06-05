@@ -6,7 +6,12 @@ from .daemon import Daemon
 
 def cmd_daemon(args):
     """Run the daemon. If --plugin is given, install its triggers but skip steps."""
-    d = Daemon(port=args.port, baud=args.baud, state_dir=args.state_dir)
+    d = Daemon(
+        port=args.port,
+        baud=args.baud,
+        state_dir=args.state_dir,
+        auto_fallback_port=getattr(args, "auto_fallback_port", False),
+    )
     if getattr(args, "plugin", None):
         plugin_path = _resolve_plugin(args.plugin)
         book = rb.load(plugin_path)
@@ -63,7 +68,12 @@ def cmd_run(args):
     book = rb.load(plugin_path)
     print(f"[cli] loaded plugin: {book.get('name')} from {plugin_path}", flush=True)
 
-    d = Daemon(port=args.port, baud=args.baud, state_dir=args.state_dir)
+    d = Daemon(
+        port=args.port,
+        baud=args.baud,
+        state_dir=args.state_dir,
+        auto_fallback_port=args.auto_fallback_port,
+    )
     ctx = rb.RunbookContext(daemon=d, vars=dict(book.get("vars", {})))
     # Allow CLI overrides: --var key=val
     for kv in args.var or []:
@@ -75,7 +85,10 @@ def cmd_run(args):
     # Start daemon in a thread so we can run steps in main
     t = threading.Thread(target=d.start, daemon=True)
     t.start()
-    time.sleep(1)  # let daemon initialize
+    # Wait until the serial port is actually open before issuing writes
+    if not d.wait_connected(timeout=30.0):
+        print("[cli] daemon failed to connect to serial port within 30s", flush=True)
+        sys.exit(2)
 
     try:
         ok = rb.execute_steps(book, ctx)
@@ -166,6 +179,11 @@ def main():
     common.add_argument("--port", default="/dev/ttyUSB0")
     common.add_argument("--baud", type=int, default=115200)
     common.add_argument("--state-dir", default=os.path.expanduser("~/.serial-runner"))
+    common.add_argument(
+        "--auto-fallback-port",
+        action="store_true",
+        help="if --port is missing, fall back to any /dev/ttyUSB*/ttyACM* (risky: may pick wrong device)",
+    )
 
     p_daemon = sub.add_parser("daemon", parents=[common], help="run daemon only")
     p_daemon.add_argument("--plugin", help="install plugin's triggers (skip steps)")
