@@ -41,9 +41,28 @@ def cmd_watch(args):
     )
 
 
+# Kernel timestamp regex matched against raw bytes (no decode needed).
+_KERNEL_TS_RE = re.compile(rb"^\[\s*\d+\.\d+\]")
+# Precomputed translation table: printable ASCII + \n + \r kept, everything else -> '.'.
+_CLEAN_TABLE = bytes(
+    b if (0x20 <= b <= 0x7e) or b in (0x0a, 0x0d) else 0x2e
+    for b in range(256)
+)
+
+
+def _open_tail(log_path, from_end):
+    """Open log file and seek per from_end; return (file, inode, size)."""
+    f = open(log_path, "rb")
+    st = os.fstat(f.fileno())
+    if from_end:
+        f.seek(0, 2)
+    else:
+        f.seek(0)
+    return f, st.st_ino, st.st_size
+
+
 def cmd_tail(args):
     """Follow the serial log in real time with optional garble-cleaning."""
-    kernel_ts_re = re.compile(r"^\[\s*\d+\.\d+\]")
     log_path = args.log or os.path.join(args.state_dir, "serial.log")
 
     # Wait briefly for the log file to exist.
@@ -56,23 +75,51 @@ def cmd_tail(args):
         return 1
 
     partial = b""
+    last_data_t = time.monotonic()
+    flush_after = args.flush_partial
     try:
-        with open(log_path, "rb") as f:
-            if args.from_ == "end":
-                f.seek(0, 2)
-            else:
-                f.seek(0)
+        f, cur_ino, _ = _open_tail(log_path, from_end=(args.from_ == "end"))
+        try:
             while True:
                 chunk = f.read(8192)
                 if not chunk:
+                    # EOF: check for rotation/truncation before sleeping.
+                    try:
+                        st_disk = os.stat(log_path)
+                        pos = f.tell()
+                        rotated = st_disk.st_ino != cur_ino
+                        truncated = st_disk.st_size < pos
+                        if rotated or truncated:
+                            # Flush any pending partial before reopening.
+                            if partial and args.drop_kernel_timestamps:
+                                sys.stdout.buffer.write(partial)
+                                sys.stdout.buffer.flush()
+                                partial = b""
+                            f.close()
+                            f, cur_ino, _ = _open_tail(log_path, from_end=False)
+                            last_data_t = time.monotonic()
+                            continue
+                    except FileNotFoundError:
+                        # Log briefly gone (mid-rotate); just wait and retry.
+                        pass
+                    # Idle: flush stale partial buffer so interactive prompts
+                    # (login:, password:) that lack a trailing newline get shown.
+                    if (
+                        args.drop_kernel_timestamps
+                        and partial
+                        and (time.monotonic() - last_data_t) >= flush_after
+                    ):
+                        sys.stdout.buffer.write(partial)
+                        sys.stdout.buffer.flush()
+                        partial = b""
                     time.sleep(args.poll)
                     continue
+                last_data_t = time.monotonic()
+                # Apply byte-clean translation BEFORE the kernel-ts filter so
+                # the partial buffer is already clean.
                 if not args.raw:
                     chunk = chunk.replace(b"\x00", b"").replace(b"\x07", b"")
-                    chunk = bytes(
-                        b if (0x20 <= b <= 0x7e) or b in (0x0a, 0x0d) else 0x2e
-                        for b in chunk
-                    )
+                    chunk = chunk.translate(_CLEAN_TABLE)
                 if args.drop_kernel_timestamps:
                     partial += chunk
                     lines = partial.split(b"\n")
@@ -82,11 +129,8 @@ def cmd_tail(args):
                     for line in complete:
                         # Strip trailing \r for matching but preserve in output.
                         test = line.rstrip(b"\r")
-                        try:
-                            if kernel_ts_re.match(test.decode("utf-8", errors="replace")):
-                                continue
-                        except Exception:
-                            pass
+                        if _KERNEL_TS_RE.match(test):
+                            continue
                         out += line + b"\n"
                     if out:
                         sys.stdout.buffer.write(out)
@@ -94,6 +138,8 @@ def cmd_tail(args):
                 else:
                     sys.stdout.buffer.write(chunk)
                     sys.stdout.buffer.flush()
+        finally:
+            f.close()
     except KeyboardInterrupt:
         return 0
 
@@ -295,6 +341,8 @@ def main():
     p_tail.add_argument("--raw", action="store_true", help="disable garble byte-class mapping (output exact bytes)")
     p_tail.add_argument("--drop-kernel-timestamps", action="store_true",
                         help="drop lines starting with kernel timestamp [N.NNNNNN]")
+    p_tail.add_argument("--flush-partial", type=float, default=1.0,
+                        help="seconds of inactivity before flushing a partial (no-newline) line buffer when --drop-kernel-timestamps is set (default: 1.0)")
     p_tail.set_defaults(func=cmd_tail)
 
     p_up = sub.add_parser("up", parents=[common], help="launch tmux UI + daemon (+ optional plugin)")
