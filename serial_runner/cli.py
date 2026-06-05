@@ -1,5 +1,5 @@
 """serial-runner CLI."""
-import argparse, os, shlex, sys, subprocess, threading, time
+import argparse, os, re, shlex, sys, subprocess, threading, time
 from . import runbook as rb
 from .daemon import Daemon
 
@@ -39,6 +39,63 @@ def cmd_watch(args):
         clean_bytes=args.clean,
         max_bytes_per_tick=args.max_bytes_per_tick,
     )
+
+
+def cmd_tail(args):
+    """Follow the serial log in real time with optional garble-cleaning."""
+    kernel_ts_re = re.compile(r"^\[\s*\d+\.\d+\]")
+    log_path = args.log or os.path.join(args.state_dir, "serial.log")
+
+    # Wait briefly for the log file to exist.
+    waited = 0.0
+    while not os.path.exists(log_path) and waited < 10.0:
+        time.sleep(0.5)
+        waited += 0.5
+    if not os.path.exists(log_path):
+        print(f"[tail] log file not found: {log_path}", file=sys.stderr)
+        return 1
+
+    partial = b""
+    try:
+        with open(log_path, "rb") as f:
+            if args.from_ == "end":
+                f.seek(0, 2)
+            else:
+                f.seek(0)
+            while True:
+                chunk = f.read(8192)
+                if not chunk:
+                    time.sleep(args.poll)
+                    continue
+                if not args.raw:
+                    chunk = chunk.replace(b"\x00", b"").replace(b"\x07", b"")
+                    chunk = bytes(
+                        b if (0x20 <= b <= 0x7e) or b in (0x0a, 0x0d) else 0x2e
+                        for b in chunk
+                    )
+                if args.drop_kernel_timestamps:
+                    partial += chunk
+                    lines = partial.split(b"\n")
+                    partial = lines[-1]
+                    complete = lines[:-1]
+                    out = b""
+                    for line in complete:
+                        # Strip trailing \r for matching but preserve in output.
+                        test = line.rstrip(b"\r")
+                        try:
+                            if kernel_ts_re.match(test.decode("utf-8", errors="replace")):
+                                continue
+                        except Exception:
+                            pass
+                        out += line + b"\n"
+                    if out:
+                        sys.stdout.buffer.write(out)
+                        sys.stdout.buffer.flush()
+                else:
+                    sys.stdout.buffer.write(chunk)
+                    sys.stdout.buffer.flush()
+    except KeyboardInterrupt:
+        return 0
 
 
 def cmd_ai(args):
@@ -228,6 +285,17 @@ def main():
     p_ai.add_argument("--buffer-ticks", type=int, default=12, help="rolling buffer size in NDJSON ticks")
     p_ai.add_argument("--out", default=None, help="also append narration to this file")
     p_ai.set_defaults(func=cmd_ai)
+
+    p_tail = sub.add_parser("tail", help="follow the serial log in real time with optional garble-cleaning (alternative to `tail -F | tr ...`)")
+    p_tail.add_argument("--log", default=None, help="log file path (default: state_dir/serial.log)")
+    p_tail.add_argument("--state-dir", default=os.path.expanduser("~/.serial-runner"))
+    p_tail.add_argument("--from", dest="from_", choices=["end", "start"], default="end",
+                        help="start from end (default, like tail -F) or start of file")
+    p_tail.add_argument("--poll", type=float, default=0.2, help="polling interval seconds")
+    p_tail.add_argument("--raw", action="store_true", help="disable garble byte-class mapping (output exact bytes)")
+    p_tail.add_argument("--drop-kernel-timestamps", action="store_true",
+                        help="drop lines starting with kernel timestamp [N.NNNNNN]")
+    p_tail.set_defaults(func=cmd_tail)
 
     p_up = sub.add_parser("up", parents=[common], help="launch tmux UI + daemon (+ optional plugin)")
     p_up.add_argument("--plugin")
