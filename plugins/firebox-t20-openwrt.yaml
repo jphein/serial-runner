@@ -32,9 +32,11 @@ triggers:
       send: " "
     debounce: 10
 
-  # U-Boot prompt → start tftpboot of the kernel
+  # U-Boot prompt → start tftpboot of the kernel.
+  # NOTE: no `^`/`$` anchors — the runner compiles regexes without re.MULTILINE
+  # and searches a large rolling log buffer, so anchored patterns never match.
   - id: UBOOT_PROMPT
-    pattern: 're:^=> ?$'
+    pattern: 're:=> ?'
     action:
       send: "tftpboot ${kernel_addr} ${tftp_server}:${kernel_file}\r"
     debounce: 60
@@ -55,9 +57,10 @@ triggers:
       send: "\r"
     debounce: 600
 
-  # OpenWrt root shell prompt → first-boot setup runs from the runbook steps
+  # OpenWrt root shell prompt → first-boot setup runs from the runbook steps.
+  # No `^` anchor — see UBOOT_PROMPT note above.
   - id: OPENWRT_SHELL
-    pattern: 're:^root@OpenWrt:[~/]+ ?#'
+    pattern: 're:root@OpenWrt:[~/]+ ?#'
     action: { send: "" }
     debounce: 600
 
@@ -68,5 +71,6 @@ steps:
     timeout: 600
   - send: "uci set network.lan.ipaddr='10.0.1.1'\r"
   - send: "uci commit network && /etc/init.d/network restart\r"
-  - send: "passwd <<'EOF'\nopenwrt-t20\nopenwrt-t20\nEOF\r"
+  # Single-line non-interactive password set — heredoc over serial is fragile.
+  - send: "echo 'root:openwrt-t20' | chpasswd\r"
   - send: "echo 'OpenWrt T20 ready' > /tmp/bootstrap-complete\r"

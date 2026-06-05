@@ -10,19 +10,14 @@ vars: {}
 # Serial is GARBLED via the CH340 USB-RS232 adapter (~1% bit-flip rate at 115200)
 # so all triggers use regex with tolerant patterns.
 triggers:
-  # Send Down arrow + Enter at the autoboot countdown to select WSB Recovery
-  # (the entry below WSA in the menu). Pattern is forgiving — matches any of
-  # the obvious countdown indicators that should survive at least once with
-  # single-byte garble.
-  # Aggressive: fire on the U-Boot banner (earliest possible). Then send
-  # MANY Down+Enter pairs spread across ~8 seconds — covers whatever the
-  # actual autoboot window turns out to be.
-  - id: SELECT_WSB_RECOVERY
+  # Observer trigger: fire on the U-Boot banner so the `steps` sequence below
+  # has a clear handoff point. The actual key-sending happens in `steps` as
+  # atomic `send` actions — a `type` action with a delay would insert that
+  # delay BETWEEN the bytes of each ANSI escape `\x1b[B`, which U-Boot would
+  # then parse as 3 separate keypresses instead of one Down-arrow.
+  - id: UBOOT_BANNER
     pattern: "re:[Uu]-?[Bb]oot|2018"
-    action:
-      type: "\x1b[B\r\x1b[B\r\x1b[B\r\x1b[B\r\x1b[B\r\x1b[B\r\x1b[B\r\x1b[B\r\x1b[B\r\x1b[B\r\x1b[B\r\x1b[B\r"
-      delay: 0.8
-      end: ""
+    action: { send: "" }
     debounce: 600
 
   # Observer only — note when Fireware reaches login. No action.
@@ -30,3 +25,22 @@ triggers:
     pattern: "re:[Tt]20.{0,3}login|Recovery.{0,3}login|WatchGuard-XTM.{0,3}login"
     action: { send: "" }
     debounce: 300
+
+# After the U-Boot banner appears, walk through Down+Enter presses spaced out
+# enough to cover the autoboot window. Each `send` ships the 3-byte ANSI
+# sequence atomically; the `wait` between sends gives U-Boot time to register
+# the keypress before the next one.
+steps:
+  - wait_for: "re:[Uu]-?[Bb]oot|2018"
+    timeout: 30
+  - send: "\x1b[B\r"
+  - wait: 0.8
+  - send: "\x1b[B\r"
+  - wait: 0.8
+  - send: "\x1b[B\r"
+  - wait: 0.8
+  - send: "\x1b[B\r"
+  - wait: 0.8
+  - send: "\x1b[B\r"
+  - wait: 0.8
+  - send: "\x1b[B\r"
