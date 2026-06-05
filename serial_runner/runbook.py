@@ -197,12 +197,28 @@ def load(yaml_path: str) -> dict:
 
 
 def install_triggers(rb: dict, daemon: Daemon, ctx: RunbookContext) -> None:
-    """Register all `triggers:` entries with the daemon."""
+    """Register all `triggers:` entries with the daemon.
+
+    Pattern syntax:
+      - plain string: literal byte match
+      - "re:<regex>":  compiled regex (useful for garbled serial — match one of
+                       many possible substrings, or a class like [Bb]oot)
+    """
     for t in rb.get("triggers", []):
         action = _make_action(t["action"], daemon, ctx)
+        raw = t["pattern"]
+        if isinstance(raw, str) and raw.startswith("re:"):
+            try:
+                pattern = re.compile(raw[3:].encode())
+            except re.error as e:
+                raise ValueError(f"trigger {t['id']!r} has invalid regex pattern {raw!r}: {e}") from e
+        elif isinstance(raw, str):
+            pattern = raw.encode()
+        else:
+            pattern = raw
         trig = Trigger(
             name=t["id"],
-            pattern=t["pattern"].encode() if isinstance(t["pattern"], str) else t["pattern"],
+            pattern=pattern,
             action=action,
             debounce_s=t.get("debounce", 30.0),
         )
