@@ -32,6 +32,7 @@ rm    ~/.serial-runner/disable_autoboot   # re-arm
 | `serial-runner keys` | run keystroke relay attached to a running daemon |
 | `serial-runner run --plugin X` | execute a plugin against a running serial port (no UI) |
 | `serial-runner watch [--interval 5] [--drop-kernel-timestamps]` | NDJSON delta feed of new serial bytes per tick. Designed as the LLM context channel. |
+| `serial-runner tail [--from end\|start] [--drop-kernel-timestamps] [--raw]` | Real-time tail of the serial log with garble-cleaning. Drop-in replacement for hand-rolled `tail -F | tr ... ` pipelines. |
 | `serial-runner ai --plugin X [--model claude-sonnet-4-6] [--out file.log]` | Read `watch`'s NDJSON on stdin; consult Claude on triggers (ERROR / IDLE / ASK), suggest the next action. Cache the runbook+system prompt so only the new serial bytes are uncached per call. |
 
 ### LLM channel (v0.2)

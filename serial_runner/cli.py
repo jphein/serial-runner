@@ -1,5 +1,5 @@
 """serial-runner CLI."""
-import argparse, os, shlex, sys, subprocess, threading, time
+import argparse, os, re, shlex, sys, subprocess, threading, time
 from . import runbook as rb
 from .daemon import Daemon
 
@@ -39,6 +39,109 @@ def cmd_watch(args):
         clean_bytes=args.clean,
         max_bytes_per_tick=args.max_bytes_per_tick,
     )
+
+
+# Kernel timestamp regex matched against raw bytes (no decode needed).
+_KERNEL_TS_RE = re.compile(rb"^\[\s*\d+\.\d+\]")
+# Precomputed translation table: printable ASCII + \n + \r kept, everything else -> '.'.
+_CLEAN_TABLE = bytes(
+    b if (0x20 <= b <= 0x7e) or b in (0x0a, 0x0d) else 0x2e
+    for b in range(256)
+)
+
+
+def _open_tail(log_path, from_end):
+    """Open log file and seek per from_end; return (file, inode, size)."""
+    f = open(log_path, "rb")
+    st = os.fstat(f.fileno())
+    if from_end:
+        f.seek(0, 2)
+    else:
+        f.seek(0)
+    return f, st.st_ino, st.st_size
+
+
+def cmd_tail(args):
+    """Follow the serial log in real time with optional garble-cleaning."""
+    log_path = args.log or os.path.join(args.state_dir, "serial.log")
+
+    # Wait briefly for the log file to exist.
+    waited = 0.0
+    while not os.path.exists(log_path) and waited < 10.0:
+        time.sleep(0.5)
+        waited += 0.5
+    if not os.path.exists(log_path):
+        print(f"[tail] log file not found: {log_path}", file=sys.stderr)
+        return 1
+
+    partial = b""
+    last_data_t = time.monotonic()
+    flush_after = args.flush_partial
+    try:
+        f, cur_ino, _ = _open_tail(log_path, from_end=(args.from_ == "end"))
+        try:
+            while True:
+                chunk = f.read(8192)
+                if not chunk:
+                    # EOF: check for rotation/truncation before sleeping.
+                    try:
+                        st_disk = os.stat(log_path)
+                        pos = f.tell()
+                        rotated = st_disk.st_ino != cur_ino
+                        truncated = st_disk.st_size < pos
+                        if rotated or truncated:
+                            # Flush any pending partial before reopening.
+                            if partial and args.drop_kernel_timestamps:
+                                sys.stdout.buffer.write(partial)
+                                sys.stdout.buffer.flush()
+                                partial = b""
+                            f.close()
+                            f, cur_ino, _ = _open_tail(log_path, from_end=False)
+                            last_data_t = time.monotonic()
+                            continue
+                    except FileNotFoundError:
+                        # Log briefly gone (mid-rotate); just wait and retry.
+                        pass
+                    # Idle: flush stale partial buffer so interactive prompts
+                    # (login:, password:) that lack a trailing newline get shown.
+                    if (
+                        args.drop_kernel_timestamps
+                        and partial
+                        and (time.monotonic() - last_data_t) >= flush_after
+                    ):
+                        sys.stdout.buffer.write(partial)
+                        sys.stdout.buffer.flush()
+                        partial = b""
+                    time.sleep(args.poll)
+                    continue
+                last_data_t = time.monotonic()
+                # Apply byte-clean translation BEFORE the kernel-ts filter so
+                # the partial buffer is already clean.
+                if not args.raw:
+                    chunk = chunk.replace(b"\x00", b"").replace(b"\x07", b"")
+                    chunk = chunk.translate(_CLEAN_TABLE)
+                if args.drop_kernel_timestamps:
+                    partial += chunk
+                    lines = partial.split(b"\n")
+                    partial = lines[-1]
+                    complete = lines[:-1]
+                    out = b""
+                    for line in complete:
+                        # Strip trailing \r for matching but preserve in output.
+                        test = line.rstrip(b"\r")
+                        if _KERNEL_TS_RE.match(test):
+                            continue
+                        out += line + b"\n"
+                    if out:
+                        sys.stdout.buffer.write(out)
+                        sys.stdout.buffer.flush()
+                else:
+                    sys.stdout.buffer.write(chunk)
+                    sys.stdout.buffer.flush()
+        finally:
+            f.close()
+    except KeyboardInterrupt:
+        return 0
 
 
 def cmd_ai(args):
@@ -228,6 +331,19 @@ def main():
     p_ai.add_argument("--buffer-ticks", type=int, default=12, help="rolling buffer size in NDJSON ticks")
     p_ai.add_argument("--out", default=None, help="also append narration to this file")
     p_ai.set_defaults(func=cmd_ai)
+
+    p_tail = sub.add_parser("tail", help="follow the serial log in real time with optional garble-cleaning (alternative to `tail -F | tr ...`)")
+    p_tail.add_argument("--log", default=None, help="log file path (default: state_dir/serial.log)")
+    p_tail.add_argument("--state-dir", default=os.path.expanduser("~/.serial-runner"))
+    p_tail.add_argument("--from", dest="from_", choices=["end", "start"], default="end",
+                        help="start from end (default, like tail -F) or start of file")
+    p_tail.add_argument("--poll", type=float, default=0.2, help="polling interval seconds")
+    p_tail.add_argument("--raw", action="store_true", help="disable garble byte-class mapping (output exact bytes)")
+    p_tail.add_argument("--drop-kernel-timestamps", action="store_true",
+                        help="drop lines starting with kernel timestamp [N.NNNNNN]")
+    p_tail.add_argument("--flush-partial", type=float, default=1.0,
+                        help="seconds of inactivity before flushing a partial (no-newline) line buffer when --drop-kernel-timestamps is set (default: 1.0)")
+    p_tail.set_defaults(func=cmd_tail)
 
     p_up = sub.add_parser("up", parents=[common], help="launch tmux UI + daemon (+ optional plugin)")
     p_up.add_argument("--plugin")
