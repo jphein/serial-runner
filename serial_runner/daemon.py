@@ -83,7 +83,25 @@ class Daemon:
         if isinstance(data, str):
             data = data.encode()
         tx = self.ser_out if self.ser_out is not None else self.ser
-        tx.write(data); tx.flush()
+        if tx is None:
+            print("[daemon] cannot send: no active serial port", flush=True)
+            return
+        try:
+            tx.write(data); tx.flush()
+        except (serial.SerialException, OSError) as e:
+            # If the out-port fails mid-flight, log + drop it and try the main
+            # port. We never fall back the other direction (main port failures
+            # are handled by the reader's reopen loop).
+            if tx is self.ser_out:
+                print(f"[daemon] out-port write failed: {e} — falling back to main port", flush=True)
+                self.ser_out = None
+                if self.ser is not None:
+                    try:
+                        self.ser.write(data); self.ser.flush()
+                    except (serial.SerialException, OSError) as fb:
+                        print(f"[daemon] fallback write also failed: {fb}", flush=True)
+            else:
+                print(f"[daemon] write failed: {e}", flush=True)
 
     def type_chars(self, s: str, delay: float = 0.10, end: str = "\r") -> None:
         """Char-by-char with delay — for prompts that drop chars at fast input."""
@@ -188,8 +206,9 @@ class Daemon:
                     data = os.read(fd, 4096)
                     if not data:
                         os.close(fd); break
-                    tx = self.ser_out if self.ser_out is not None else self.ser
-                    tx.write(data); tx.flush()
+                    # Route through self.send() so the FIFO path gets the same
+                    # port selection + error handling as trigger actions.
+                    self.send(data)
             except Exception as e:
                 print(f"[daemon] fifo err: {e}", flush=True)
                 time.sleep(0.5)
