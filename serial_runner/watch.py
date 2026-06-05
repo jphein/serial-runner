@@ -19,6 +19,12 @@ class Tick:
 
 KERNEL_TS = re.compile(r"^\[\s*\d+\.\d+\]")
 
+# Precomputed translation table: keep printable ASCII (0x20-0x7e) + LF + CR,
+# map everything else to '.'. Used by ``_clean`` via ``bytes.translate`` (C-fast).
+_CLEAN_TABLE = bytes(
+    b if (0x20 <= b <= 0x7e) or b in (0x0a, 0x0d) else 0x2e for b in range(256)
+)
+
 
 def _clean(buf: bytes, drop_kernel_ts: bool, clean_bytes: bool = False) -> tuple[str, int]:
     """Decode + strip BEL/CR. Optionally drop kernel-timestamp lines.
@@ -31,8 +37,8 @@ def _clean(buf: bytes, drop_kernel_ts: bool, clean_bytes: bool = False) -> tuple
     buf = buf.replace(b"\x07", b"")
     if clean_bytes:
         buf = buf.replace(b"\x00", b"")
-        # Map any byte outside printable ASCII + LF + CR to '.'
-        buf = bytes(b if (0x20 <= b <= 0x7e) or b in (0x0a, 0x0d) else 0x2e for b in buf)
+        # Map any byte outside printable ASCII + LF + CR to '.' (C-implemented)
+        buf = buf.translate(_CLEAN_TABLE)
     text = buf.replace(b"\r", b"").decode("utf-8", "replace")
     if not drop_kernel_ts:
         return text, 0
