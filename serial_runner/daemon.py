@@ -130,7 +130,7 @@ class Daemon:
         # an inode race where they write into an orphaned pipe nobody reads.
         # Only recreate if the path exists but isn't a FIFO.
         try:
-            st = os.stat(self.fifo_path)
+            st = os.lstat(self.fifo_path)
             if not stat.S_ISFIFO(st.st_mode):
                 os.unlink(self.fifo_path)
                 raise FileNotFoundError
