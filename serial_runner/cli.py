@@ -28,6 +28,7 @@ def cmd_watch(args):
         drop_kernel_ts=args.drop_kernel_timestamps,
         from_end=not args.from_start,
         clean_bytes=args.clean,
+        max_bytes_per_tick=args.max_bytes_per_tick,
     )
 
 
@@ -188,6 +189,8 @@ def main():
                          help="start emitting from the beginning of the log (default: from current end)")
     p_watch.add_argument("--clean", action="store_true",
                          help="Strip NUL/BEL and map non-printable bytes to '.' (for noisy adapters like CH340).")
+    p_watch.add_argument("--max-bytes-per-tick", type=int, default=None,
+                         help="Split ticks larger than N bytes into multiple JSON lines (avoids overwhelming downstream consumers). Default: no split.")
     p_watch.set_defaults(func=cmd_watch)
 
     p_ai = sub.add_parser("ai", parents=[common], help="LLM channel — read NDJSON serial deltas, stream narration or trigger-based suggestions")

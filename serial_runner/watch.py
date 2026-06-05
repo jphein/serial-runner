@@ -51,14 +51,48 @@ def _clean(buf: bytes, drop_kernel_ts: bool, clean_bytes: bool = False) -> tuple
     return "\n".join(out_lines), dropped
 
 
+def _split_content(data: bytes, max_bytes: int) -> list[str]:
+    """Split already-encoded UTF-8 bytes into chunks of at most max_bytes.
+
+    Prefers to split on the nearest newline boundary at or before max_bytes;
+    falls back to a hard byte-split if no newline is available in the window.
+    Operates on encoded bytes so the byte-size guarantee holds; decoding back
+    to str is safe because newline ('\\n' = 0x0A) is never part of a multi-byte
+    UTF-8 sequence, and the hard-split fallback only triggers on chunks with
+    no newline (e.g., binary-ish blobs), where 'utf-8','replace' decoding will
+    repair any boundary-straddling byte sequences.
+    """
+    chunks: list[str] = []
+    i = 0
+    n = len(data)
+    while i < n:
+        end = min(i + max_bytes, n)
+        if end < n:
+            # look for the last newline in data[i:end]
+            nl = data.rfind(b"\n", i, end)
+            if nl != -1 and nl >= i:
+                end = nl + 1  # include the newline
+        chunks.append(data[i:end].decode("utf-8", "replace"))
+        i = end
+    return chunks or [""]
+
+
 def watch(
     log_path: str,
     interval_s: float = 5.0,
     drop_kernel_ts: bool = False,
     from_end: bool = True,
     clean_bytes: bool = False,
+    max_bytes_per_tick: "Optional[int]" = None,
 ) -> None:
-    """Poll the log file, emit a JSON line per tick when new bytes appear."""
+    """Poll the log file, emit a JSON line per tick when new bytes appear.
+
+    If max_bytes_per_tick is set and a tick's cleaned content exceeds it, the
+    tick is split across multiple JSON lines (each tagged with chunk_index /
+    chunk_total) so downstream consumers aren't flooded by huge bursts.
+    """
+    if max_bytes_per_tick is not None and max_bytes_per_tick <= 0:
+        raise ValueError("max_bytes_per_tick must be greater than 0")
     prev_size = os.path.getsize(log_path) if (os.path.exists(log_path) and from_end) else 0
     while True:
         try:
@@ -71,15 +105,33 @@ def watch(
                 f.seek(prev_size)
                 buf = f.read(delta)
             content, dropped = _clean(buf, drop_kernel_ts, clean_bytes)
-            tick = Tick(
-                t=time.strftime("%H:%M:%S"),
-                epoch=time.time(),
-                bytes_added=delta,
-                content=content,
-                kernel_lines_dropped=dropped,
-            )
-            sys.stdout.write(json.dumps(asdict(tick)) + "\n")
-            sys.stdout.flush()
+            t_str = time.strftime("%H:%M:%S")
+            epoch = time.time()
+            if max_bytes_per_tick is not None and len(content_bytes := content.encode("utf-8")) > max_bytes_per_tick:
+                pieces = _split_content(content_bytes, max_bytes_per_tick)
+                total = len(pieces)
+                for idx, piece in enumerate(pieces):
+                    obj = {
+                        "t": t_str,
+                        "epoch": epoch,
+                        "bytes_added": len(piece.encode("utf-8")),
+                        "content": piece,
+                        "kernel_lines_dropped": dropped if idx == 0 else 0,
+                        "chunk_index": idx,
+                        "chunk_total": total,
+                    }
+                    sys.stdout.write(json.dumps(obj) + "\n")
+                    sys.stdout.flush()
+            else:
+                tick = Tick(
+                    t=t_str,
+                    epoch=epoch,
+                    bytes_added=delta,
+                    content=content,
+                    kernel_lines_dropped=dropped,
+                )
+                sys.stdout.write(json.dumps(asdict(tick)) + "\n")
+                sys.stdout.flush()
             prev_size = cur_size
         elif cur_size < prev_size:
             # log rotated/truncated — restart from current end
