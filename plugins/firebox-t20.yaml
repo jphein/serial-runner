@@ -1,0 +1,32 @@
+name: firebox-t20
+description: "WatchGuard Firebox T20 (FS2AE5, NXP LS1023A) — auto-select WSB Recovery at boot menu, observe Fireware. Target: install Debian ARM64."
+
+vars: {}
+
+# WatchGuard's customized U-Boot autoboot CANNOT be interrupted by standard
+# keys (verified empirically + community confirmation). The only menu interaction
+# that works is arrow keys + Enter to pick WSA or WSB Recovery.
+#
+# Serial is GARBLED via the CH340 USB-RS232 adapter (~1% bit-flip rate at 115200)
+# so all triggers use regex with tolerant patterns.
+triggers:
+  # Send Down arrow + Enter at the autoboot countdown to select WSB Recovery
+  # (the entry below WSA in the menu). Pattern is forgiving — matches any of
+  # the obvious countdown indicators that should survive at least once with
+  # single-byte garble.
+  # Aggressive: fire on the U-Boot banner (earliest possible). Then send
+  # MANY Down+Enter pairs spread across ~8 seconds — covers whatever the
+  # actual autoboot window turns out to be.
+  - id: SELECT_WSB_RECOVERY
+    pattern: "re:[Uu]-?[Bb]oot|2018"
+    action:
+      type: "\x1b[B\r\x1b[B\r\x1b[B\r\x1b[B\r\x1b[B\r\x1b[B\r\x1b[B\r\x1b[B\r\x1b[B\r\x1b[B\r\x1b[B\r\x1b[B\r"
+      delay: 0.8
+      end: ""
+    debounce: 600
+
+  # Observer only — note when Fireware reaches login. No action.
+  - id: FIREWARE_LOGIN
+    pattern: "re:[Tt]20.{0,3}login|Recovery.{0,3}login|WatchGuard-XTM.{0,3}login"
+    action: { send: "" }
+    debounce: 300
