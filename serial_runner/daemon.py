@@ -1,6 +1,6 @@
 """serial-runner daemon: owns one serial port, logs to disk, accepts input via FIFO,
 runs trigger engine with byte-level pattern detection."""
-import serial, os, sys, time, threading, re, stat
+import serial, os, sys, time, threading, re, stat, glob
 from dataclasses import dataclass, field
 from typing import Callable, Optional, Pattern, Union
 
@@ -75,7 +75,13 @@ class Daemon:
 
     def _reader(self) -> None:
         while self._running:
-            data = self.ser.read(4096)
+            try:
+                data = self.ser.read(4096)
+            except (serial.SerialException, OSError) as e:
+                print(f"[daemon] serial read err: {e} — reopening", flush=True)
+                self.logf.write(f"\n[daemon] PORT LOST: {e}\n".encode())
+                self._reopen_serial()
+                continue
             if not data:
                 continue
             sys.stdout.buffer.write(data); sys.stdout.buffer.flush()
@@ -96,6 +102,43 @@ class Daemon:
                     with self.lock:
                         self.det_buf.clear()
                     threading.Thread(target=self._fire, args=(t,), daemon=True).start()
+
+    def _find_port(self):
+        """Return the configured port if it exists, else any /dev/ttyUSB*/ttyACM*."""
+        if os.path.exists(self.port):
+            return self.port
+        candidates = sorted(glob.glob("/dev/ttyUSB*") + glob.glob("/dev/ttyACM*"))
+        return candidates[0] if candidates else None
+
+    def _open_serial(self):
+        """Try to open the serial port. True on success."""
+        port = self._find_port()
+        if not port:
+            return False
+        try:
+            self.ser = serial.Serial(port, self.baud, bytesize=8, parity="N", stopbits=1, timeout=0.05)
+            if port != self.port:
+                print(f"[daemon] port {self.port} unavailable, using {port} instead", flush=True)
+                self.logf.write(f"\n[daemon] PORT REMAPPED: {self.port} -> {port}\n".encode())
+            return True
+        except (serial.SerialException, OSError) as e:
+            print(f"[daemon] open {port} failed: {e}", flush=True)
+            return False
+
+    def _reopen_serial(self):
+        """Block-with-backoff until the port comes back."""
+        try:
+            self.ser.close()
+        except Exception:
+            pass
+        backoff = 0.5
+        while self._running:
+            if self._open_serial():
+                print(f"[daemon] reconnected to {self.ser.port}", flush=True)
+                self.logf.write(f"\n[daemon] PORT RECONNECTED: {self.ser.port}\n".encode())
+                return
+            time.sleep(backoff)
+            backoff = min(backoff * 1.5, 5.0)
 
     def _fire(self, t: Trigger) -> None:
         print(f"[daemon] TRIGGER {t.name} fired", flush=True)
@@ -119,12 +162,13 @@ class Daemon:
                 time.sleep(0.5)
 
     def start(self) -> None:
-        # Open serial
-        self.ser = serial.Serial(
-            self.port, self.baud,
-            bytesize=8, parity="N", stopbits=1, timeout=0.05,
-        )
+        # Open log first so reconnection messages have a destination
         self.logf = open(self.log_path, "ab", buffering=0)
+        # Open serial (wait for it if not present yet)
+        if not self._open_serial():
+            print(f"port {self.port} not present — waiting...", flush=True)
+            self._running = True
+            self._reopen_serial()
         # Create FIFO if missing. CRUCIAL: don't unlink an existing FIFO —
         # keys.py readers may already have it open by inode; unlinking creates
         # an inode race where they write into an orphaned pipe nobody reads.
