@@ -170,6 +170,33 @@ def cmd_keys(args):
     return keys.main(args.fifo)
 
 
+def cmd_break(args):
+    """Tell a running daemon to drive a serial BREAK on its TX port.
+
+    Useful for entering kernel Magic SysRq mode, interrupting certain
+    bootloaders, and recovering stuck remote consoles."""
+    import signal as _signal
+    import subprocess as _sp
+    # Find the daemon PID — pgrep is reliable and avoids us having to parse /proc.
+    pid_out = _sp.run(
+        ["pgrep", "-f", "serial_runner.cli daemon"],
+        capture_output=True, text=True,
+    )
+    pids = [int(p) for p in pid_out.stdout.split() if p.isdigit()]
+    if not pids:
+        print("[break] no daemon process found", file=sys.stderr)
+        return 1
+    if len(pids) > 1:
+        print(f"[break] multiple daemon processes found ({pids}); sending to all", file=sys.stderr)
+    for pid in pids:
+        try:
+            os.kill(pid, _signal.SIGUSR1)
+            print(f"[break] SIGUSR1 → pid {pid}")
+        except ProcessLookupError:
+            print(f"[break] pid {pid} gone", file=sys.stderr)
+    return 0
+
+
 def cmd_run(args):
     """Load a runbook plugin and execute it, with the daemon serving alongside."""
     plugin_path = _resolve_plugin(args.plugin)
@@ -306,6 +333,9 @@ def main():
     p_keys = sub.add_parser("keys", help="run keystroke relay (attach to running daemon)")
     p_keys.add_argument("--fifo", default=os.path.expanduser("~/.serial-runner/input.fifo"))
     p_keys.set_defaults(func=cmd_keys)
+
+    p_break = sub.add_parser("break", help="tell running daemon to drive a serial BREAK on its TX port (for sysrq, bootloader interrupt, etc.)")
+    p_break.set_defaults(func=cmd_break)
 
     p_run = sub.add_parser("run", parents=[common], help="execute a runbook plugin")
     p_run.add_argument("--plugin", required=True)

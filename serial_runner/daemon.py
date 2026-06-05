@@ -194,6 +194,24 @@ class Daemon:
                 print(f"[daemon] fifo err: {e}", flush=True)
                 time.sleep(0.5)
 
+    def _send_break(self, duration: float = 0.25) -> None:
+        """Drive a serial BREAK condition on the TX port.
+
+        Useful for entering kernel Magic SysRq mode, interrupting some U-Boot
+        variants, and recovering stuck remote consoles. Triggered via SIGUSR1
+        — see start()."""
+        tx = self.ser_out if self.ser_out is not None else self.ser
+        if tx is None:
+            print("[daemon] BREAK requested but no TX port is open", flush=True)
+            return
+        try:
+            tx.send_break(duration=duration)
+            with self.lock:
+                self.logf.write(f"\n[daemon] BREAK sent ({duration:.2f}s) on {tx.port}\n".encode())
+            print(f"[daemon] BREAK sent ({duration:.2f}s) on {tx.port}", flush=True)
+        except Exception as e:
+            print(f"[daemon] BREAK error: {e}", flush=True)
+
     def _reload_plugin(self) -> None:
         """Re-read the YAML at self.plugin_path and atomically swap triggers.
 
@@ -270,6 +288,11 @@ class Daemon:
             signal.signal(signal.SIGHUP, lambda *_: threading.Thread(target=self._reload_plugin, daemon=True).start())
         else:
             print("[daemon] SIGHUP not available on this platform; plugin hot-reload disabled", flush=True)
+
+        # SIGUSR1 → drive a serial BREAK on the TX port. Handler returns
+        # immediately because send_break blocks for `duration` seconds.
+        if hasattr(signal, "SIGUSR1"):
+            signal.signal(signal.SIGUSR1, lambda *_: threading.Thread(target=self._send_break, daemon=True).start())
 
         self._running = True
         threading.Thread(target=self._reader, daemon=True).start()
