@@ -20,9 +20,20 @@ class Tick:
 KERNEL_TS = re.compile(r"^\[\s*\d+\.\d+\]")
 
 
-def _clean(buf: bytes, drop_kernel_ts: bool) -> tuple[str, int]:
-    """Decode + strip BEL/CR. Optionally drop kernel-timestamp lines."""
-    text = buf.replace(b"\x07", b"").replace(b"\r", b"").decode("utf-8", "replace")
+def _clean(buf: bytes, drop_kernel_ts: bool, clean_bytes: bool = False) -> tuple[str, int]:
+    """Decode + strip BEL/CR. Optionally drop kernel-timestamp lines.
+
+    When ``clean_bytes`` is True, also drop NUL bytes and map any byte outside
+    printable ASCII (0x20-0x7e) plus LF/CR to '.' before decoding. This makes
+    output from noisy USB-serial adapters (e.g. CH340 bit-error RX) readable
+    while preserving line structure.
+    """
+    buf = buf.replace(b"\x07", b"")
+    if clean_bytes:
+        buf = buf.replace(b"\x00", b"")
+        # Map any byte outside printable ASCII + LF + CR to '.'
+        buf = bytes(b if (0x20 <= b <= 0x7e) or b in (0x0a, 0x0d) else 0x2e for b in buf)
+    text = buf.replace(b"\r", b"").decode("utf-8", "replace")
     if not drop_kernel_ts:
         return text, 0
     out_lines, dropped = [], 0
@@ -39,6 +50,7 @@ def watch(
     interval_s: float = 5.0,
     drop_kernel_ts: bool = False,
     from_end: bool = True,
+    clean_bytes: bool = False,
 ) -> None:
     """Poll the log file, emit a JSON line per tick when new bytes appear."""
     prev_size = os.path.getsize(log_path) if (os.path.exists(log_path) and from_end) else 0
@@ -52,7 +64,7 @@ def watch(
             with open(log_path, "rb") as f:
                 f.seek(prev_size)
                 buf = f.read(delta)
-            content, dropped = _clean(buf, drop_kernel_ts)
+            content, dropped = _clean(buf, drop_kernel_ts, clean_bytes)
             tick = Tick(
                 t=time.strftime("%H:%M:%S"),
                 epoch=time.time(),

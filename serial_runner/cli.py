@@ -19,6 +19,7 @@ def cmd_watch(args):
         interval_s=args.interval,
         drop_kernel_ts=args.drop_kernel_timestamps,
         from_end=not args.from_start,
+        clean_bytes=args.clean,
     )
 
 
@@ -170,6 +171,8 @@ def main():
                          help="filter out lines starting with [N.NNNNNN] kernel timestamps")
     p_watch.add_argument("--from-start", action="store_true",
                          help="start emitting from the beginning of the log (default: from current end)")
+    p_watch.add_argument("--clean", action="store_true",
+                         help="Strip NUL/BEL and map non-printable bytes to '.' (for noisy adapters like CH340).")
     p_watch.set_defaults(func=cmd_watch)
 
     p_ai = sub.add_parser("ai", parents=[common], help="LLM channel — read NDJSON serial deltas, stream narration or trigger-based suggestions")
