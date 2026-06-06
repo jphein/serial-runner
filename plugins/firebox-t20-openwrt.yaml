@@ -9,8 +9,12 @@ description: >
 
 vars:
   tftp_server: "10.0.1.2"
-  kernel_addr:   "0x80000000"
-  kernel_file:   "openwrt-layerscape-fsl_ls1043a-t20-kernel.bin"
+  kernel_addr: "0x80000000"
+  kernel_file: "openwrt-layerscape-fsl_ls1043a-t20-kernel.bin"
+  # Root password set on first boot. OVERRIDE THIS with `--var root_password=...`
+  # when invoking the runbook; the default below is a non-secret placeholder
+  # only suitable for lab/throwaway use.
+  root_password: "CHANGE_ME"
 
 triggers:
   # ----- U-Boot phase -----
@@ -72,5 +76,6 @@ steps:
   - send: "uci set network.lan.ipaddr='10.0.1.1'\r"
   - send: "uci commit network && /etc/init.d/network restart\r"
   # Single-line non-interactive password set — heredoc over serial is fragile.
-  - send: "echo 'root:openwrt-t20' | chpasswd\r"
+  # Value comes from the `root_password` var; set it with `--var root_password=...`.
+  - send: "echo 'root:${root_password}' | chpasswd\r"
   - send: "echo 'OpenWrt T20 ready' > /tmp/bootstrap-complete\r"
