@@ -12,6 +12,7 @@ def cmd_daemon(args):
         baud=args.baud,
         state_dir=args.state_dir,
         auto_fallback_port=getattr(args, "auto_fallback_port", False),
+        out_port=getattr(args, "out_port", None),
     )
     plugin_path = getattr(args, "plugin", None)
     if plugin_path:
@@ -169,6 +170,33 @@ def cmd_keys(args):
     return keys.main(args.fifo)
 
 
+def cmd_break(args):
+    """Tell a running daemon to drive a serial BREAK on its TX port.
+
+    Useful for entering kernel Magic SysRq mode, interrupting certain
+    bootloaders, and recovering stuck remote consoles."""
+    import signal as _signal
+    import subprocess as _sp
+    # Find the daemon PID — pgrep is reliable and avoids us having to parse /proc.
+    pid_out = _sp.run(
+        ["pgrep", "-f", "serial_runner.cli daemon"],
+        capture_output=True, text=True,
+    )
+    pids = [int(p) for p in pid_out.stdout.split() if p.isdigit()]
+    if not pids:
+        print("[break] no daemon process found", file=sys.stderr)
+        return 1
+    if len(pids) > 1:
+        print(f"[break] multiple daemon processes found ({pids}); sending to all", file=sys.stderr)
+    for pid in pids:
+        try:
+            os.kill(pid, _signal.SIGUSR1)
+            print(f"[break] SIGUSR1 → pid {pid}")
+        except ProcessLookupError:
+            print(f"[break] pid {pid} gone", file=sys.stderr)
+    return 0
+
+
 def cmd_run(args):
     """Load a runbook plugin and execute it, with the daemon serving alongside."""
     plugin_path = _resolve_plugin(args.plugin)
@@ -180,6 +208,7 @@ def cmd_run(args):
         baud=args.baud,
         state_dir=args.state_dir,
         auto_fallback_port=args.auto_fallback_port,
+        out_port=getattr(args, "out_port", None),
     )
     ctx = rb.RunbookContext(daemon=d, vars=dict(book.get("vars", {})))
     # Allow CLI overrides: --var key=val
@@ -291,6 +320,11 @@ def main():
         action="store_true",
         help="if --port is missing, fall back to any /dev/ttyUSB*/ttyACM* (risky: may pick wrong device)",
     )
+    common.add_argument(
+        "--out-port",
+        default=None,
+        help="optional separate TX port. When set, FIFO writes and trigger send()s go here while --port is used only for reads. For asymmetric wiring (e.g. clean TTL header for RX, RS-232 for TX).",
+    )
 
     p_daemon = sub.add_parser("daemon", parents=[common], help="run daemon only")
     p_daemon.add_argument("--plugin", help="runbook YAML to install triggers from (hot-reloadable via SIGHUP)")
@@ -299,6 +333,9 @@ def main():
     p_keys = sub.add_parser("keys", help="run keystroke relay (attach to running daemon)")
     p_keys.add_argument("--fifo", default=os.path.expanduser("~/.serial-runner/input.fifo"))
     p_keys.set_defaults(func=cmd_keys)
+
+    p_break = sub.add_parser("break", help="tell running daemon to drive a serial BREAK on its TX port (for sysrq, bootloader interrupt, etc.)")
+    p_break.set_defaults(func=cmd_break)
 
     p_run = sub.add_parser("run", parents=[common], help="execute a runbook plugin")
     p_run.add_argument("--plugin", required=True)
