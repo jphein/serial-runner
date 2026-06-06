@@ -1,0 +1,19 @@
+name: firebox-m500
+description: "WatchGuard Firebox M500 (Lanner FW-7585, x86_64) — halt GRUB autoboot so user can edit. Target: OpenWrt x86_64 via USB or shell drop via init=/bin/sh."
+
+vars: {}
+
+# M500 has CLEAN serial (no garble) and standard GRUB Legacy 0.97 on x86.
+# Both triggers are observers only — the user drives the menu manually from
+# the keys pane. If you want autoboot halted automatically, change GRUB_BANNER
+# to `send: "\x1b[B"` (Down arrow) or `send: " "` (space).
+triggers:
+  - id: GRUB_BANNER
+    pattern: "re:GNU GRUB"
+    action: { send: "" }
+    debounce: 600
+
+  - id: GRUB_PROMPT
+    pattern: "grub>"
+    action: { send: "" }
+    debounce: 60

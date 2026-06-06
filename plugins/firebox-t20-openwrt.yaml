@@ -1,0 +1,76 @@
+name: firebox-t20-openwrt
+description: >
+  WatchGuard Firebox T20 → OpenWrt port. Drives the post-SPI-modification
+  workflow: interrupt U-Boot autoboot, tftpboot the OpenWrt kernel from the
+  laptop, hand off to bootm, watch kernel boot, auto-activate the OpenWrt
+  console. Assumes the NOR has been modified (or is being modified) so the
+  WatchGuard autoboot is interruptible — use the SPI dump/reflash approach
+  documented in the project memory.
+
+vars:
+  tftp_server: "10.0.1.2"
+  kernel_addr:   "0x80000000"
+  kernel_file:   "openwrt-layerscape-fsl_ls1043a-t20-kernel.bin"
+
+triggers:
+  # ----- U-Boot phase -----
+
+  # Earliest U-Boot signal — banner. Once SPI mod allows it, the "Hit any key"
+  # prompt becomes interruptible; spam space to be safe.
+  - id: UBOOT_INTERRUPT
+    pattern: "re:U-Boot 20[0-9]{2}"
+    action:
+      type: "                "  # spaces
+      delay: 0.05
+      end: ""
+    debounce: 30
+
+  # Belt-and-suspenders: also catch the actual "press to stop" prompt
+  - id: UBOOT_HIT_KEY
+    pattern: "re:Hit any key|stop autoboot|press [a-z ]+ to (?:stop|interrupt)"
+    action:
+      send: " "
+    debounce: 10
+
+  # U-Boot prompt → start tftpboot of the kernel.
+  # NOTE: no `^`/`$` anchors — the runner compiles regexes without re.MULTILINE
+  # and searches a large rolling log buffer, so anchored patterns never match.
+  - id: UBOOT_PROMPT
+    pattern: 're:=> ?'
+    action:
+      send: "tftpboot ${kernel_addr} ${tftp_server}:${kernel_file}\r"
+    debounce: 60
+
+  # TFTP transfer done — boot the loaded image
+  - id: TFTP_DONE
+    pattern: "re:Bytes transferred = [0-9]+"
+    action:
+      send: "bootm ${kernel_addr}\r"
+    debounce: 30
+
+  # ----- Linux/OpenWrt phase -----
+
+  # OpenWrt's procd ready message — boot succeeded
+  - id: PROCD_READY
+    pattern: "re:procd: - init complete|Please press Enter to activate this console"
+    action:
+      send: "\r"
+    debounce: 600
+
+  # OpenWrt root shell prompt → first-boot setup runs from the runbook steps.
+  # No `^` anchor — see UBOOT_PROMPT note above.
+  - id: OPENWRT_SHELL
+    pattern: 're:root@OpenWrt:[~/]+ ?#'
+    action: { send: "" }
+    debounce: 600
+
+# Optional one-shot bootstrap steps that run after OPENWRT_SHELL fires.
+# Set up minimal config so the box is reachable for further work.
+steps:
+  - wait_for: 're:root@OpenWrt:[~/]+ ?#'
+    timeout: 600
+  - send: "uci set network.lan.ipaddr='10.0.1.1'\r"
+  - send: "uci commit network && /etc/init.d/network restart\r"
+  # Single-line non-interactive password set — heredoc over serial is fragile.
+  - send: "echo 'root:openwrt-t20' | chpasswd\r"
+  - send: "echo 'OpenWrt T20 ready' > /tmp/bootstrap-complete\r"
