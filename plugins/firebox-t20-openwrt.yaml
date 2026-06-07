@@ -1,43 +1,101 @@
 name: firebox-t20-openwrt
 description: >
-  WatchGuard Firebox T20 running OpenWrt 25.12.4. The T20 boots autonomously
-  from eMMC after a one-time SPI NOR mod (see openwrt-patches/ and
-  flash-t20.sh in the watchguard project). This plugin watches the live
-  boot: U-Boot loads the non-initramfs kernel + DTB from /dev/mmcblk0p3,
-  hands off to bootm with bootargs that tell the kernel to mount squashfs
-  from /dev/mmcblk0p7. mount_root sets up an F2FS overlay in the unused
-  tail of p7. Plugin auto-logs in at the login prompt and runs optional
-  bootstrap steps (set hostname/password, check overlay).
+  Take a stock WatchGuard Firebox T20 (FS2AE5, NXP LS1043A) from Fireware to
+  OpenWrt 25.12.4 with squashfs+overlay persistence. End state: T20 autoboots
+  OpenWrt from eMMC, runs LuCI/wireguard/SSH, no laptop required.
+
+  This runbook orchestrates four phases:
+
+    1. HOST-SIDE SPI FLASH (require_user). Operator powers off the T20,
+       clips a CH341A SPI programmer onto U352 (MX25U3235F), runs
+       flash-t20.sh from the watchguard project to dump/patch/write the NOR
+       with a new wgBootSysA that boots OpenWrt from eMMC. Then unclips and
+       powers T20 on.
+
+    2. U-BOOT BOOTSTRAP. On a stock T20 the eMMC has Fireware files, no
+       k.bin/dtb.bin where the new wgBootSysA expects. The ext4load fails,
+       U-Boot drops to its `=>` prompt. From there we TFTP-boot an
+       initramfs kernel/DTB from the laptop so we can run OpenWrt
+       userland long enough to populate the eMMC.
+
+    3. INITRAMFS DEPLOY. SSH into the running initramfs, wget the
+       non-initramfs kernel + DTB + squashfs over HTTP, write them to the
+       right eMMC partitions: kernel/DTB to /dev/mmcblk0p3, squashfs to
+       /dev/mmcblk0p7. Reboot.
+
+    4. VERIFY + CONFIGURE. Wait for the second boot (squashfs+overlay
+       this time), confirm overlay is mounted, set hostname + root
+       password.
+
+  Required laptop-side services (run BEFORE starting this runbook):
+    - tinytftp.py serving ${tftp_root} on UDP/69 (sudo for port 69)
+    - python3 -m http.server ${http_port} --bind ${laptop_ip}
+
+  Required artifacts in ${tftp_root}:
+    - ${initramfs_kernel} (initramfs FIT, ~13 MB)
+    - ${dtb_file} (patched DTB with &ifc disabled, ~28 KB)
+    - ${final_kernel} (non-initramfs uImage, ~8 MB)
+    - ${squashfs_file} (squashfs rootfs, ~5 MB)
+
+  Network: laptop should be wired to a T20 port (defaults to the External
+  port which maps to Linux eth0 and gets DHCP from the T20 once OpenWrt is
+  running). The TFTP phase needs static IPs because the kernel isn't up
+  yet.
 
 vars:
-  # Default password baked into the image's banner instructions — override
-  # with `--var root_password=...` for production deployments.
-  root_password: "openwrt-t20"
-  hostname: "Firebox-T20"
+  # Network — static IPs used for the TFTP boot phase
+  t20_ip:          "10.0.1.1"
+  laptop_ip:       "10.0.1.2"
+  netmask:         "255.255.255.0"
+
+  # Memory addresses for bootm — high enough to avoid kernel-decompression
+  # overlap (the kernel decompresses to 0x80080000 which overruns a FIT
+  # loaded at 0x80000000)
+  kernel_addr:     "0xa0000000"
+  dtb_addr:        "0xb0000000"
+
+  # Laptop-side service ports + paths
+  tftp_root:       "/home/jp/Projects/watchguard/tftp-root"
+  http_port:       "8000"
+
+  # Artifact filenames (relative to ${tftp_root}, served by both TFTP and HTTP)
+  initramfs_kernel: "openwrt-layerscape-fsl_ls1043a-t20-kernel.bin"
+  dtb_file:         "fsl-ls1043a-t20.dtb"
+  final_kernel:     "k-25.12.4-nofs.bin"
+  squashfs_file:    "root-25.12.4.squashfs"
+
+  # Default credentials — override with `--var root_password=...` for production
+  root_password:   "openwrt-t20"
+  ssh_password:    "openwrt-t20"   # same; used by runbook ssh/scp helpers
+  hostname:        "Firebox-T20"
 
 triggers:
-  # ----- U-Boot phase (informational) -----
-  # WG's modified U-Boot autoboots via wgBootSysA and is not interruptible
-  # under our current NOR patch. These triggers just log progress.
+  # ----- U-Boot phase -----
 
   - id: UBOOT_BANNER
     pattern: "re:U-Boot 20[0-9]{2}"
-    action: { send: "" }      # no-op: just mark in log
-    debounce: 30
+    action: { send: "" }
+    debounce: 300
 
-  - id: KERNEL_LOAD
-    pattern: "re:Loading Kernel Image"
+  # wgBootSysA's ext4load fails on a fresh T20 — kernel never loads, U-Boot
+  # drops to its prompt. This is the signal we wait for to start TFTP boot.
+  - id: UBOOT_PROMPT
+    pattern: 're:=> ?'
+    action: { send: "" }
+    debounce: 60
+
+  - id: TFTP_DONE
+    pattern: "re:Bytes transferred = [0-9]+"
     action: { send: "" }
     debounce: 30
 
-  # ----- Linux boot phase -----
+  # ----- Linux/OpenWrt phase -----
 
   - id: KERNEL_BANNER
     pattern: "re:Linux version [0-9]+\\.[0-9]+"
     action: { send: "" }
     debounce: 30
 
-  # mount_root finishing — overlay should now be live
   - id: OVERLAY_UP
     pattern: "re:mount_root: switching to .* overlay|overlayfs:.* type overlay"
     action: { send: "" }
@@ -48,9 +106,6 @@ triggers:
     action: { send: "\r" }
     debounce: 600
 
-  # ----- OpenWrt userland phase -----
-
-  # Auto-login at the login prompt (only fires if dropbear/getty asks)
   - id: LOGIN_PROMPT
     pattern: "re:T20 login:|OpenWrt login:|Firebox-T20 login:"
     action: { send: "root\r" }
@@ -61,50 +116,194 @@ triggers:
     action: { send: "${root_password}\r" }
     debounce: 30
 
-  # Reached an interactive shell on the unconfigured image (hostname still
-  # OpenWrt — likely a fresh deploy that hasn't restored config yet).
   - id: OPENWRT_SHELL_FRESH
     pattern: 're:root@OpenWrt:[~/]+ ?#'
     action: { send: "" }
     debounce: 600
 
-  # Reached the configured shell — normal post-bootstrap state.
   - id: T20_SHELL
     pattern: 're:root@Firebox-T20:[~/]+ ?#'
     action: { send: "" }
     debounce: 600
 
-  # ----- Recovery / unexpected -----
+  # ----- Canary signals -----
 
-  # Kernel panic — surface it
   - id: KERNEL_PANIC
     pattern: "re:Kernel panic - not syncing"
     action: { send: "" }
     debounce: 600
 
-  # SError — usually means DTS/IFC mismatch; should not happen on the patched DTB
   - id: SERROR
     pattern: "re:SError Interrupt"
     action: { send: "" }
     debounce: 600
 
-# Optional one-shot bootstrap. Runs after a fresh OpenWrt shell is reached
-# (e.g. after the squashfs has just been deployed and overlay is empty).
-# These commands are idempotent — safe to re-run on an already-bootstrapped box.
+
 steps:
-  - wait_for: 're:root@(OpenWrt|Firebox-T20):[~/]+ ?#'
-    timeout: 600
+  # ============================================================
+  # PHASE 1 — Host-side SPI NOR flash
+  # ============================================================
+  - id: phase1_spi_flash
+    require_user: |
+      ============================================================
+      PHASE 1: Host-side SPI flash of the T20 NOR
 
-  # Set hostname
-  - send: "uci set system.@system[0].hostname=${hostname}\r"
-  - send: "uci commit system && /etc/init.d/system reload\r"
+      1. Power off the T20 (unplug PSU)
+      2. Clip the CH341A+1.8V adapter onto U352 (MX25U3235F SOIC-8).
+         Match the clip's red wire (pin 1) to the chip's pin 1 dot.
+      3. On the LAPTOP, run from the watchguard project:
+            cd ~/Projects/watchguard
+            ./scripts/flash-t20.sh dump   t20-nor.bin
+            ./scripts/flash-t20.sh patch  t20-nor.bin
+            ./scripts/flash-t20.sh write  t20-nor.patched.bin
+      4. Verify the write completes with "VERIFIED."
+      5. Unclip the programmer.
+      6. Make sure laptop is wired to T20's External port (eth0) with
+         static IP ${laptop_ip}/${netmask}.
+      7. Make sure laptop-side services are running:
+            sudo tinytftp.py ${tftp_root} &
+            cd ${tftp_root} && python3 -m http.server ${http_port} \
+                                       --bind ${laptop_ip} &
+      8. Plug the T20 PSU back in.
 
-  # Set root password
-  - send: "echo 'root:${root_password}' | chpasswd\r"
+      Waiting for U-Boot banner to confirm boot...
+    until: "re:U-Boot 20[0-9]{2}"
+    timeout: 300
 
-  # Verify overlay is live
-  - send: "mount | grep -E 'overlay|/rom' | head -2\r"
-  - send: "df -h /overlay\r"
+  # ============================================================
+  # PHASE 2 — TFTP-boot the initramfs kernel
+  # ============================================================
+  - id: phase2_wait_uboot_prompt
+    # On a fresh T20 the patched wgBootSysA tries ext4load — fails — drops
+    # to "=>" prompt. (If eMMC already has k.bin/dtb.bin, OpenWrt boots
+    # straight through and we skip the TFTP detour by failing this wait
+    # and proceeding to phase4_wait_ssh.)
+    wait_for: 're:=> ?'
+    timeout: 90
 
-  # Mark bootstrap done
-  - send: "echo 'T20 OpenWrt ready' > /tmp/bootstrap-complete\r"
+  - id: phase2_set_ip
+    send: "setenv ipaddr ${t20_ip}\r"
+  - wait: 0.5
+  - id: phase2_set_serverip
+    send: "setenv serverip ${laptop_ip}\r"
+  - wait: 0.5
+  - id: phase2_set_netmask
+    send: "setenv netmask ${netmask}\r"
+  - wait: 0.5
+
+  - id: phase2_tftp_kernel
+    send: "tftpboot ${kernel_addr} ${initramfs_kernel}\r"
+  - wait_for: "re:Bytes transferred = [0-9]+"
+    timeout: 90
+
+  - id: phase2_tftp_dtb
+    send: "tftpboot ${dtb_addr} ${dtb_file}\r"
+  - wait_for: "re:Bytes transferred = [0-9]+"
+    timeout: 30
+
+  - id: phase2_bootm
+    send: "bootm ${kernel_addr} - ${dtb_addr}\r"
+
+  # ============================================================
+  # PHASE 3 — Deploy to eMMC from inside the initramfs
+  # ============================================================
+  - id: phase3_wait_shell
+    wait_for: 're:root@OpenWrt:[~/]+ ?#'
+    timeout: 240
+
+  # Bring up WAN-side eth0 with a static IP so we can wget from the laptop.
+  # The initramfs default LAN config uses eth0 in br-lan; for our T20 hardware,
+  # eth0 IS the WAN port. Override LAN to use a different port temporarily.
+  - id: phase3_setup_network
+    send_lines: |
+      ip addr add ${t20_ip}/24 dev eth0
+      ip link set eth0 up
+      ip route add default via ${laptop_ip}
+
+  - id: phase3_wait_link
+    wait: 3
+
+  - id: phase3_format_p3
+    send: "mkfs.ext4 -F /dev/mmcblk0p3 && echo P3-OK\r"
+  - wait_for: "re:P3-OK"
+    timeout: 60
+
+  - id: phase3_mount_p3
+    send: "mount /dev/mmcblk0p3 /mnt\r"
+  - wait: 1
+
+  - id: phase3_fetch_kernel
+    send: "wget -O /mnt/k.bin http://${laptop_ip}:${http_port}/${final_kernel} && echo K-OK\r"
+  - wait_for: "re:K-OK"
+    timeout: 120
+
+  - id: phase3_fetch_dtb
+    send: "wget -O /mnt/dtb.bin http://${laptop_ip}:${http_port}/${dtb_file} && echo DTB-OK\r"
+  - wait_for: "re:DTB-OK"
+    timeout: 30
+
+  - id: phase3_unmount_p3
+    send: "sync && umount /mnt && echo P3-UMOUNTED\r"
+  - wait_for: "re:P3-UMOUNTED"
+    timeout: 15
+
+  - id: phase3_write_squashfs
+    # Stream the squashfs straight onto /dev/mmcblk0p7. mount_root will
+    # find the squashfs magic ("hsqs") and auto-allocate F2FS overlay in
+    # the unused tail of the partition.
+    send: "wget -O - http://${laptop_ip}:${http_port}/${squashfs_file} | dd of=/dev/mmcblk0p7 bs=1M conv=fsync && echo SQUASHFS-OK\r"
+  - wait_for: "re:SQUASHFS-OK"
+    timeout: 180
+
+  - id: phase3_verify_squashfs
+    send: 'dd if=/dev/mmcblk0p7 bs=4 count=1 2>/dev/null | head -c 4; echo " <- should be hsqs"\r'
+  - wait_for: "re:hsqs"
+    timeout: 10
+
+  - id: phase3_reboot
+    send: "sync && reboot\r"
+
+  # ============================================================
+  # PHASE 4 — Verify squashfs+overlay boot
+  # ============================================================
+  - id: phase4_wait_overlay
+    wait_for: "re:mount_root: switching to .* overlay|overlayfs:.* type overlay"
+    timeout: 180
+
+  - id: phase4_wait_shell
+    wait_for: 're:root@OpenWrt:[~/]+ ?#'
+    timeout: 120
+
+  # Set hostname + password (overlay is now writable so these persist)
+  - id: phase4_set_hostname
+    send: "uci set system.@system[0].hostname=${hostname} && uci commit system && /etc/init.d/system reload\r"
+  - wait: 2
+
+  - id: phase4_set_password
+    send: "echo 'root:${root_password}' | chpasswd && echo PW-OK\r"
+  - wait_for: "re:PW-OK"
+    timeout: 5
+
+  # Verify overlay layout
+  - id: phase4_check_overlay
+    send: "mount | grep -E 'overlay|/rom' | head -2 ; df -h /overlay\r"
+  - wait: 2
+
+  - id: phase4_mark_done
+    send: "echo 'T20 OpenWrt install complete' > /tmp/install-complete\r"
+
+  - id: phase4_summary
+    require_user: |
+      ============================================================
+      INSTALL COMPLETE.
+
+      Next steps (manual, optional):
+        - Configure WAN: uci set network.wan.device=eth0; ...
+        - Configure VLANs as needed
+        - Install LuCI/wireguard packages (apk add ...) — persist via overlay
+        - Open SSH/HTTP on wan zone if managing over the WAN-side network
+
+      The T20 will now autoboot OpenWrt from eMMC. No laptop required.
+      Press Enter to finish this runbook.
+    until: 're:^\r'
+    timeout: 86400
