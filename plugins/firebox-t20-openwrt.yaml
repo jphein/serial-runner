@@ -1,81 +1,110 @@
 name: firebox-t20-openwrt
 description: >
-  WatchGuard Firebox T20 → OpenWrt port. Drives the post-SPI-modification
-  workflow: interrupt U-Boot autoboot, tftpboot the OpenWrt kernel from the
-  laptop, hand off to bootm, watch kernel boot, auto-activate the OpenWrt
-  console. Assumes the NOR has been modified (or is being modified) so the
-  WatchGuard autoboot is interruptible — use the SPI dump/reflash approach
-  documented in the project memory.
+  WatchGuard Firebox T20 running OpenWrt 25.12.4. The T20 boots autonomously
+  from eMMC after a one-time SPI NOR mod (see openwrt-patches/ and
+  flash-t20.sh in the watchguard project). This plugin watches the live
+  boot: U-Boot loads the non-initramfs kernel + DTB from /dev/mmcblk0p3,
+  hands off to bootm with bootargs that tell the kernel to mount squashfs
+  from /dev/mmcblk0p7. mount_root sets up an F2FS overlay in the unused
+  tail of p7. Plugin auto-logs in at the login prompt and runs optional
+  bootstrap steps (set hostname/password, check overlay).
 
 vars:
-  tftp_server: "10.0.1.2"
-  kernel_addr: "0x80000000"
-  kernel_file: "openwrt-layerscape-fsl_ls1043a-t20-kernel.bin"
-  # Root password set on first boot. OVERRIDE THIS with `--var root_password=...`
-  # when invoking the runbook; the default below is a non-secret placeholder
-  # only suitable for lab/throwaway use.
-  root_password: "CHANGE_ME"
+  # Default password baked into the image's banner instructions — override
+  # with `--var root_password=...` for production deployments.
+  root_password: "openwrt-t20"
+  hostname: "Firebox-T20"
 
 triggers:
-  # ----- U-Boot phase -----
+  # ----- U-Boot phase (informational) -----
+  # WG's modified U-Boot autoboots via wgBootSysA and is not interruptible
+  # under our current NOR patch. These triggers just log progress.
 
-  # Earliest U-Boot signal — banner. Once SPI mod allows it, the "Hit any key"
-  # prompt becomes interruptible; spam space to be safe.
-  - id: UBOOT_INTERRUPT
+  - id: UBOOT_BANNER
     pattern: "re:U-Boot 20[0-9]{2}"
-    action:
-      type: "                "  # spaces
-      delay: 0.05
-      end: ""
+    action: { send: "" }      # no-op: just mark in log
     debounce: 30
 
-  # Belt-and-suspenders: also catch the actual "press to stop" prompt
-  - id: UBOOT_HIT_KEY
-    pattern: "re:Hit any key|stop autoboot|press [a-z ]+ to (?:stop|interrupt)"
-    action:
-      send: " "
-    debounce: 10
-
-  # U-Boot prompt → start tftpboot of the kernel.
-  # NOTE: no `^`/`$` anchors — the runner compiles regexes without re.MULTILINE
-  # and searches a large rolling log buffer, so anchored patterns never match.
-  - id: UBOOT_PROMPT
-    pattern: 're:=> ?'
-    action:
-      send: "tftpboot ${kernel_addr} ${tftp_server}:${kernel_file}\r"
-    debounce: 60
-
-  # TFTP transfer done — boot the loaded image
-  - id: TFTP_DONE
-    pattern: "re:Bytes transferred = [0-9]+"
-    action:
-      send: "bootm ${kernel_addr}\r"
+  - id: KERNEL_LOAD
+    pattern: "re:Loading Kernel Image"
+    action: { send: "" }
     debounce: 30
 
-  # ----- Linux/OpenWrt phase -----
+  # ----- Linux boot phase -----
 
-  # OpenWrt's procd ready message — boot succeeded
+  - id: KERNEL_BANNER
+    pattern: "re:Linux version [0-9]+\\.[0-9]+"
+    action: { send: "" }
+    debounce: 30
+
+  # mount_root finishing — overlay should now be live
+  - id: OVERLAY_UP
+    pattern: "re:mount_root: switching to .* overlay|overlayfs:.* type overlay"
+    action: { send: "" }
+    debounce: 30
+
   - id: PROCD_READY
-    pattern: "re:procd: - init complete|Please press Enter to activate this console"
-    action:
-      send: "\r"
+    pattern: "re:procd: - init|Please press Enter to activate this console"
+    action: { send: "\r" }
     debounce: 600
 
-  # OpenWrt root shell prompt → first-boot setup runs from the runbook steps.
-  # No `^` anchor — see UBOOT_PROMPT note above.
-  - id: OPENWRT_SHELL
+  # ----- OpenWrt userland phase -----
+
+  # Auto-login at the login prompt (only fires if dropbear/getty asks)
+  - id: LOGIN_PROMPT
+    pattern: "re:T20 login:|OpenWrt login:|Firebox-T20 login:"
+    action: { send: "root\r" }
+    debounce: 30
+
+  - id: PASSWORD_PROMPT
+    pattern: "re:Password:"
+    action: { send: "${root_password}\r" }
+    debounce: 30
+
+  # Reached an interactive shell on the unconfigured image (hostname still
+  # OpenWrt — likely a fresh deploy that hasn't restored config yet).
+  - id: OPENWRT_SHELL_FRESH
     pattern: 're:root@OpenWrt:[~/]+ ?#'
     action: { send: "" }
     debounce: 600
 
-# Optional one-shot bootstrap steps that run after OPENWRT_SHELL fires.
-# Set up minimal config so the box is reachable for further work.
+  # Reached the configured shell — normal post-bootstrap state.
+  - id: T20_SHELL
+    pattern: 're:root@Firebox-T20:[~/]+ ?#'
+    action: { send: "" }
+    debounce: 600
+
+  # ----- Recovery / unexpected -----
+
+  # Kernel panic — surface it
+  - id: KERNEL_PANIC
+    pattern: "re:Kernel panic - not syncing"
+    action: { send: "" }
+    debounce: 600
+
+  # SError — usually means DTS/IFC mismatch; should not happen on the patched DTB
+  - id: SERROR
+    pattern: "re:SError Interrupt"
+    action: { send: "" }
+    debounce: 600
+
+# Optional one-shot bootstrap. Runs after a fresh OpenWrt shell is reached
+# (e.g. after the squashfs has just been deployed and overlay is empty).
+# These commands are idempotent — safe to re-run on an already-bootstrapped box.
 steps:
-  - wait_for: 're:root@OpenWrt:[~/]+ ?#'
+  - wait_for: 're:root@(OpenWrt|Firebox-T20):[~/]+ ?#'
     timeout: 600
-  - send: "uci set network.lan.ipaddr='10.0.1.1'\r"
-  - send: "uci commit network && /etc/init.d/network restart\r"
-  # Single-line non-interactive password set — heredoc over serial is fragile.
-  # Value comes from the `root_password` var; set it with `--var root_password=...`.
+
+  # Set hostname
+  - send: "uci set system.@system[0].hostname=${hostname}\r"
+  - send: "uci commit system && /etc/init.d/system reload\r"
+
+  # Set root password
   - send: "echo 'root:${root_password}' | chpasswd\r"
-  - send: "echo 'OpenWrt T20 ready' > /tmp/bootstrap-complete\r"
+
+  # Verify overlay is live
+  - send: "mount | grep -E 'overlay|/rom' | head -2\r"
+  - send: "df -h /overlay\r"
+
+  # Mark bootstrap done
+  - send: "echo 'T20 OpenWrt ready' > /tmp/bootstrap-complete\r"
