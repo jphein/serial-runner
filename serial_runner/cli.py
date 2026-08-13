@@ -170,6 +170,98 @@ def cmd_keys(args):
     return keys.main(args.fifo)
 
 
+def cmd_send(args):
+    """One-shot 'paste': write TEXT to the daemon's input FIFO (→ serial TX).
+
+    The non-interactive complement to `keys`. Appends a carriage return by
+    default (most device consoles — U-Boot, RT-Thread, BusyBox — expect CR,
+    not LF). Use --hex for control bytes ('03' = Ctrl-C, '0d' = bare CR),
+    --no-newline to omit the ending, or --end to override it."""
+    fifo_path = args.fifo
+    if not os.path.exists(fifo_path):
+        print(f"[send] FIFO {fifo_path} missing — is the daemon up? (serial-runner up)",
+              file=sys.stderr)
+        return 1
+    if args.hex:
+        try:
+            payload = bytes.fromhex(args.text.replace(" ", ""))
+        except ValueError as e:
+            print(f"[send] bad --hex value {args.text!r}: {e}", file=sys.stderr)
+            return 2
+    else:
+        payload = args.text.encode("utf-8", "replace")
+        if not args.no_newline:
+            payload += args.end.encode()
+    # Non-blocking open so a FIFO with no reader (daemon down) fails loudly
+    # with ENXIO instead of hanging forever waiting for one.
+    try:
+        fd = os.open(fifo_path, os.O_WRONLY | os.O_NONBLOCK)
+    except OSError as e:
+        print(f"[send] cannot open FIFO ({e}) — no daemon reading it?", file=sys.stderr)
+        return 1
+    try:
+        os.write(fd, payload)
+    finally:
+        os.close(fd)
+    return 0
+
+
+def cmd_scan(args):
+    """Sweep candidate baud rates on a FREE port; rank by printable-ASCII ratio.
+
+    A pad-and-baud finder for board bring-up. Stop any running daemon first
+    (it owns the port). A rate that yields mostly-printable bytes with newlines
+    is the console baud; if NO rate decodes, the pad is probably not a UART TX
+    (a continuous clock/audio/data line reads as garbage at every baud)."""
+    import serial as _serial
+    if args.rates:
+        rates = [int(r) for r in args.rates.replace(" ", "").split(",") if r]
+    else:
+        rates = [115200, 921600, 460800, 230400, 256000, 74880,
+                 57600, 38400, 19200, 9600, 1500000, 2000000]
+
+    def score(data: bytes) -> float:
+        if not data:
+            return 0.0
+        return sum(1 for c in data if c in (9, 10, 13) or 32 <= c <= 126) / len(data)
+
+    def samp(data: bytes, n: int = 90) -> str:
+        return "".join(chr(c) if 32 <= c <= 126 else "." for c in data[:n])
+
+    results = []
+    for b in rates:
+        try:
+            s = _serial.Serial(args.port, b, timeout=0.3)
+        except Exception as e:
+            print(f"{b:>8}: OPEN ERR {e}", file=sys.stderr)
+            continue
+        try:
+            s.reset_input_buffer()
+            buf = b""
+            t0 = time.time()
+            while time.time() - t0 < args.dwell:
+                buf += s.read(512)
+        finally:
+            s.close()
+        r = score(buf)
+        results.append((r, len(buf), b, samp(buf)))
+        print(f"{b:>8}: {len(buf):>5}B  printable={r:0.2f}  |{samp(buf)}|", flush=True)
+
+    results.sort(reverse=True)
+    print("\n== ranked (most printable first) ==")
+    for r, n, b, sp in results[:5]:
+        flag = "   <-- looks like TEXT" if (r > 0.75 and n > 8) else ""
+        print(f"  {b:>8} baud  printable={r:0.2f}  {n}B{flag}")
+    if results and results[0][0] > 0.75 and results[0][1] > 8:
+        print(f"\n[scan] likely console baud: {results[0][2]}  "
+              f"(bring the daemon up with --baud {results[0][2]})")
+    else:
+        print("\n[scan] no rate produced clean text. Likely NOT a UART TX pad "
+              "(continuous clock/audio/data reads as garbage at every baud), or the "
+              "line only emits a boot log at reset — rescan while power-cycling the board.")
+    return 0
+
+
 def cmd_break(args):
     """Tell a running daemon to drive a serial BREAK on its TX port.
 
@@ -236,7 +328,13 @@ def cmd_run(args):
 
 def cmd_up(args):
     """Launch daemon + tmux UI: top=serial-tail, bottom=keys.py.
-    If --plugin is given, also runs the runbook in a background pane."""
+    If --plugin is given, also runs the runbook in a background pane.
+
+    Panes are targeted by their stable tmux pane-id (%N), captured at
+    creation via `-P -F '#{pane_id}'`, rather than positional
+    session:window.pane indices. Positional targets like `:0.1` break
+    whenever the user's tmux sets `base-index`/`pane-base-index` to
+    anything but 0; pane-ids are unaffected."""
     state_dir = args.state_dir or os.path.expanduser("~/.serial-runner")
     os.makedirs(state_dir, exist_ok=True)
     log_path = os.path.join(state_dir, "serial.log")
@@ -246,6 +344,12 @@ def cmd_up(args):
     # Kill prior session if --force
     if args.force:
         subprocess.run(["tmux", "kill-session", "-t", session], capture_output=True)
+
+    def tmux(*a, capture=False):
+        """Run a tmux subcommand; return stripped stdout when capture=True."""
+        r = subprocess.run(["tmux", *a], check=True,
+                           capture_output=capture, text=True)
+        return r.stdout.strip() if capture else None
 
     # Daemon command. Run as `sudo` only if requested.
     # If --plugin is set, the daemon installs its triggers itself — no
@@ -257,39 +361,43 @@ def cmd_up(args):
         + f"{shlex.quote(py)} -m serial_runner.cli daemon --port {shlex.quote(args.port)} --baud {args.baud} --state-dir {shlex.quote(state_dir)}{plugin_arg}"
     )
 
-    # tmux layout:
-    #   pane 0 (top): tail -F serial.log
-    #   pane 1 (right side, top): daemon
-    #   pane 2 (right side, bottom): runbook output (if --plugin) or shell
-    #   pane 3 (bottom): keys relay
-    subprocess.run([
-        "tmux", "new-session", "-d", "-s", session,
-        f"tail -F {log_path} | tr -d '\\007'",
-    ], check=True)
-    subprocess.run([
-        "tmux", "split-window", "-h", "-t", f"{session}:0", "-l", "60", daemon_cmd,
-    ], check=True)
+    # tmux layout (by role, targeted via captured pane-ids):
+    #   p_tail   (top-left):     tail -F serial.log
+    #   p_daemon (top-right):    daemon
+    #   p_info   (bottom-right): runbook info (only with --plugin)
+    #   p_keys   (bottom-left):  keystroke relay
+    # Use serial-runner's own garble-cleaning tail (non-printable bytes -> '.')
+    # rather than raw `tail -F`, so noisy/garbage serial (wrong baud, non-UART
+    # pad, boot noise) can't scramble the pane with stray control sequences.
+    tail_cmd = (
+        f"{shlex.quote(py)} -m serial_runner.cli tail "
+        f"--state-dir {shlex.quote(state_dir)} --from end"
+    )
+    p_tail = tmux("new-session", "-d", "-s", session, "-P", "-F", "#{pane_id}",
+                  tail_cmd, capture=True)
+    p_daemon = tmux("split-window", "-h", "-t", p_tail, "-l", "60",
+                    "-P", "-F", "#{pane_id}", daemon_cmd, capture=True)
     if args.plugin:
         # Triggers already installed in the daemon above; this pane just shows
         # plugin info / any future runbook steps if invoked manually.
-        info_cmd = f'echo "plugin {shlex.quote(args.plugin)} loaded in daemon (pane 1)"; echo "run steps manually with: serial-runner run --plugin {shlex.quote(args.plugin)}"; exec bash'
-        subprocess.run([
-            "tmux", "split-window", "-v", "-t", f"{session}:0.1", info_cmd,
-        ], check=True)
-    subprocess.run([
-        "tmux", "split-window", "-v", "-t", f"{session}:0.0", "-l", "8",
-        f"while true; do {shlex.quote(py)} -m serial_runner.cli keys --fifo {shlex.quote(fifo_path)}; echo '[keys.py exited — restarting]'; sleep 1; done",
-    ], check=True)
-    subprocess.run(["tmux", "set-option", "-t", session, "history-limit", "1000000"], check=True)
-    subprocess.run(["tmux", "set-option", "-t", session, "mouse", "on"], check=True)
-    subprocess.run(["tmux", "select-pane", "-t", f"{session}:0.3"], check=False)
+        info_cmd = f'echo "plugin {shlex.quote(args.plugin)} loaded in daemon"; echo "run steps manually with: serial-runner run --plugin {shlex.quote(args.plugin)}"; exec bash'
+        tmux("split-window", "-v", "-t", p_daemon, "-P", "-F", "#{pane_id}", info_cmd, capture=True)
+    keys_loop = (
+        f"while true; do {shlex.quote(py)} -m serial_runner.cli keys "
+        f"--fifo {shlex.quote(fifo_path)}; echo '[keys.py exited — restarting]'; sleep 1; done"
+    )
+    p_keys = tmux("split-window", "-v", "-t", p_tail, "-l", "8",
+                  "-P", "-F", "#{pane_id}", keys_loop, capture=True)
+    tmux("set-option", "-t", session, "history-limit", "1000000")
+    tmux("set-option", "-t", session, "mouse", "on")
+    tmux("select-pane", "-t", p_keys)
 
     print(f"[cli] tmux session '{session}' up. attach: tmux attach -t {session}")
-    print(f"[cli]   pane 0 (top-left): serial tail")
-    print(f"[cli]   pane 1 (top-right): daemon")
+    print(f"[cli]   {p_tail} (top-left): serial tail")
+    print(f"[cli]   {p_daemon} (top-right): daemon")
     if args.plugin:
-        print(f"[cli]   pane 2 (bottom-right): runbook progress")
-    print(f"[cli]   pane 3 (bottom-left): keystroke relay (focused)")
+        print(f"[cli]   (bottom-right): runbook progress")
+    print(f"[cli]   {p_keys} (bottom-left): keystroke relay (focused)")
 
 
 def _resolve_plugin(name_or_path: str) -> str:
@@ -334,8 +442,25 @@ def main():
     p_keys.add_argument("--fifo", default=os.path.expanduser("~/.serial-runner/input.fifo"))
     p_keys.set_defaults(func=cmd_keys)
 
+    p_send = sub.add_parser("send", help="one-shot paste: write TEXT to the daemon FIFO (→ serial TX)")
+    p_send.add_argument("text", help="text to send (or hex bytes with --hex)")
+    p_send.add_argument("--fifo", default=os.path.expanduser("~/.serial-runner/input.fifo"))
+    p_send.add_argument("--end", default="\r",
+                        help="line ending appended after TEXT (default: CR '\\r')")
+    p_send.add_argument("--no-newline", action="store_true",
+                        help="do not append any line ending")
+    p_send.add_argument("--hex", action="store_true",
+                        help="interpret TEXT as hex bytes, e.g. '03'=Ctrl-C, '0d'=CR")
+    p_send.set_defaults(func=cmd_send)
+
     p_break = sub.add_parser("break", help="tell running daemon to drive a serial BREAK on its TX port (for sysrq, bootloader interrupt, etc.)")
     p_break.set_defaults(func=cmd_break)
+
+    p_scan = sub.add_parser("scan", help="sweep baud rates on a FREE port, rank by printable-text ratio (pad/baud finder — stop the daemon first)")
+    p_scan.add_argument("--port", default="/dev/ttyUSB0")
+    p_scan.add_argument("--dwell", type=float, default=1.2, help="seconds to listen per rate")
+    p_scan.add_argument("--rates", default=None, help="comma-separated baud rates to try (default: common set)")
+    p_scan.set_defaults(func=cmd_scan)
 
     p_run = sub.add_parser("run", parents=[common], help="execute a runbook plugin")
     p_run.add_argument("--plugin", required=True)
