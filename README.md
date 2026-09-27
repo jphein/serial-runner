@@ -86,7 +86,7 @@ multi-port).
 
 ## License
 
-GPL-3.0-or-later. See [LICENSE](LICENSE).
+AGPL-3.0-or-later © 2026 Jeffrey Pine Hein. See [LICENSE](LICENSE).
 
 ## Design notes
 
